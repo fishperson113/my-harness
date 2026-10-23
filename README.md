@@ -44,14 +44,15 @@ Run `python3 harness.py check` in any pane for the full R1–R8 report. It never
 | R6 | Share of comment lines in a file's added lines | ≤ 30% | stop | block |
 | R7 | Commits on the branch ahead of the base branch | ≤ 3 | status | show |
 | R8 | `hack:` markers in added lines | no limit | status | show |
-| R9 | Changed lines in the change set (added + deleted, new files in full) | ≤ 400 | stop | block |
+| R9 | Lines added in the change set (new files in full; deletions not counted) | ≤ 400 | stop, status | show |
 
-File size is never limited: a 10,000-line legacy file is fine. What is limited is how much one change touches.
+File size is never limited: a 10,000-line legacy file is fine. R9 only reports how much one change adds; it never blocks, so Claude is never pushed to compress, delete tests or revert work to fit.
 
 - The change set is every file modified against `HEAD` (staged or not), deleted, or untracked and not ignored. A rename counts once.
 - Docs dirs are directories that already hold a tracked markdown file, plus `docs_extra_dirs`. Conventional files at the repo root (exactly `README`, `CHANGELOG`, `CONTRIBUTING`, `LICENSE`, `CODE_OF_CONDUCT`, `SECURITY`, `CLAUDE`, `AGENTS` with a markdown extension) do not make the root a docs dir. Creating one still goes through R4, so Claude cannot add `CLAUDE.md`, `AGENTS.md` or `CHANGELOG.md` on its own. When the repo really needs one, open the root with `docs_extra_dirs = ["."]` in `.git/my-harness.toml`.
 - `decisions.md` at the repo root is your local scratch file. It is added to `.git/info/exclude` and exempt from all rules.
 - R5 and R6 use a per-extension table (Python, JS/TS, Go, Rust, Kotlin, Java/C#/C/C++, shell, SQL, YAML/TOML). Other files skip R5 and R6.
+- Generated files are left out of R1, R2, R5, R6 and R9: built-in lockfiles (`*.lock`, `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `go.sum`, `*.min.js`, `*.min.css`), `generated_patterns`, and paths marked `-diff`, `binary` or `linguist-generated` in the root `.gitattributes`.
 
 ## Configuration
 
@@ -69,7 +70,8 @@ Later wins: built-in defaults, then `~/.config/my-harness/config.toml`, then `.g
 | `min_added_lines_for_comment_rule` | 10 | R6 skips files with fewer added non-blank lines |
 | `max_commits` | 3 | R7 limit |
 | `base_branch` | "" | Empty means `origin/HEAD`, then `main`, then `master` |
-| `max_changed_lines` | 400 | R9 limit |
+| `max_added_lines` | 400 | R9 limit |
+| `generated_patterns` | [] | Extra globs for generated files, added to the built-in lockfile list |
 | `max_retries` | 1 | Consecutive times Stop makes Claude fix violations; resets on each new user turn |
 
 State lives in `.git/my-harness/` (`state.json` cache, `error.log`).

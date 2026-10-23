@@ -3,6 +3,7 @@
 
 Commands: session, pre, stop, status (hooks and statusline) and check (manual report).
 """
+import fnmatch
 import json
 import os
 import re
@@ -20,12 +21,16 @@ DEFAULTS = {
     "docs_extra_dirs": [], "decisions_file": "decisions.md",
     "max_function_lines": 50, "max_comment_ratio": 0.30,
     "min_added_lines_for_comment_rule": 10, "max_commits": 3,
-    "base_branch": "", "max_retries": 1, "max_changed_lines": 400,
+    "base_branch": "", "max_retries": 1, "max_added_lines": 400,
+    "generated_patterns": [],
 }
 BANNED = [r"[_-](new|old|copy|backup|tmp|final)(\.[^./]*)?$", r"\.(bak|orig|tmp)$", r"~$", r" copy"]
 # api_v2.py is a copy only when api.py already exists next to it.
 VERSIONED = re.compile(r"^(.+)[_-]v\d+(\.[^./]*)?$", re.I)
 MD_EXTS = (".md", ".mdx", ".markdown")
+# Lockfiles and other generated files are left out of R5, R6 and R9; .gitattributes can add more.
+GENERATED = ["*.lock", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "go.sum", "*.min.js", "*.min.css"]
+GENERATED_ATTRS = {"-diff", "binary", "linguist-generated", "linguist-generated=true"}
 # Root files every repo has: they do not make the root a docs dir. Creating them still goes through R4.
 CONVENTIONAL_MD = re.compile(r"^(readme|changelog|contributing|license|code_of_conduct|security|claude|agents)"
                              r"\.(md|mdx|markdown)$", re.I)
@@ -141,9 +146,9 @@ def read_changes(repo, cfg):
             if fields[1][0] == "A":
                 new.add(fields[-1])
             i += entry[0] == "2"
-    changed.discard(cfg["decisions_file"])
-    new.discard(cfg["decisions_file"])
-    return head, changed, new
+    patterns = generated_patterns(repo, cfg)
+    skip = {p for p in changed if p == cfg["decisions_file"] or is_generated(p, patterns)}
+    return head, changed - skip, new - skip
 
 
 def read_text(path):
@@ -160,8 +165,8 @@ def read_text(path):
 
 
 def read_added(repo, head, new):
-    """({path: {line number: text}} added since HEAD with new files in full, count of deleted lines)."""
-    added, path, line_no, in_hunk, deleted = {}, None, 0, False, 0
+    """Map path -> {line number: text} for lines added since HEAD, new files in full."""
+    added, path, line_no, in_hunk = {}, None, 0, False
     for line in git(repo, "diff", head or EMPTY_TREE, "-U0", "--no-color", "--no-ext-diff").split("\n"):
         if line.startswith("diff --git"):
             in_hunk = False
@@ -173,13 +178,25 @@ def read_added(repo, head, new):
         elif in_hunk and line.startswith("+") and path:
             added.setdefault(path, {})[line_no] = line[1:]
             line_no += 1
-        elif in_hunk and line.startswith("-"):
-            deleted += 1
     for path in new - set(added):
         lines = read_text(os.path.join(repo.root, path))
         if lines:
             added[path] = dict(enumerate(lines, 1))
-    return added, deleted
+    return added
+
+
+def generated_patterns(repo, cfg):
+    patterns = GENERATED + list(cfg["generated_patterns"])
+    for line in (read_file(os.path.join(repo.root, ".gitattributes")) or "").splitlines():
+        fields = line.split()
+        if fields and not fields[0].startswith("#") and GENERATED_ATTRS & set(fields[1:]):
+            patterns.append(fields[0])
+    return patterns
+
+
+def is_generated(path, patterns):
+    name = path.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatch(path if "/" in p.strip("/") else name, p.lstrip("/")) for p in patterns)
 
 
 def parent_dir(path):
@@ -259,11 +276,13 @@ class Ctx:
             self._memo[key] = fn()
         return self._memo[key]
 
-    def diff(self):
-        return self.memo("diff", lambda: read_added(self.repo, self.head, self.new))
-
     def added(self):
-        return self.diff()[0]
+        return self.memo("added", self._read_added)
+
+    def _read_added(self):
+        patterns = generated_patterns(self.repo, self.cfg)
+        added = read_added(self.repo, self.head, self.new)
+        return {p: lines for p, lines in added.items() if not is_generated(p, patterns)}
 
     def docs(self):
         return self.memo("docs", lambda: docs_dirs(self.repo, self.cfg))
@@ -403,10 +422,10 @@ def r8(ctx):
 
 
 def r9(ctx):
-    added, deleted = ctx.diff()
-    n, limit = sum(len(lines) for lines in added.values()) + deleted, ctx.cfg["max_changed_lines"]
-    msg = "R9: change set has %d changed lines (limit %d). Keep this change smaller, or ask the user to commit first."
-    return n, limit, [], [msg % (n, limit)] if n > limit else []
+    n, limit = sum(len(lines) for lines in ctx.added().values()), ctx.cfg["max_added_lines"]
+    msg = ("R9: change set adds %d lines (limit %d). Stop and tell the user the change is %d lines;"
+           " do not delete, compress or revert work to get under the limit.")
+    return n, limit, [], [msg % (n, limit, n)] if n > limit else []
 
 
 # Specification registry: (id, blocks Claude, commands that run it, title, check).
@@ -419,7 +438,7 @@ RULES = [
     ("R6", True, "stop", "comment % of added lines", r6),
     ("R7", False, "stop status", "commits ahead of base", r7),
     ("R8", False, "stop", "hack: markers added", r8),
-    ("R9", True, "stop status", "lines changed (+/-)", r9),
+    ("R9", False, "stop status", "lines added (no lockfiles)", r9),
 ]
 
 
@@ -483,7 +502,6 @@ def cmd_session(repo, cfg, data):
         "- R4: new markdown files only inside docs dirs: %s." % (shown or "none"),
         "- R5: every function you touch stays within %d lines." % cfg["max_function_lines"],
         "- R6: comment lines stay under %d%% of the lines you add to a file." % round(cfg["max_comment_ratio"] * 100),
-        "- R9: at most %d changed lines (added + deleted) in the change set." % cfg["max_changed_lines"],
         "A deliberate shortcut is allowed if visible: a `hack:` comment on or just above a function",
         "exempts it from R5; one anywhere in a file exempts that file from R6.",
         "`%s` at the repo root is the user's local scratch file: never committed, exempt." % cfg["decisions_file"],
@@ -506,7 +524,7 @@ def cmd_pre(repo, cfg, data):
     tool = data.get("tool_input") or {}
     raw = tool.get("file_path") or tool.get("notebook_path")
     rel = relative(repo, data.get("cwd") or repo.root, raw) if raw else None
-    if rel is None or rel == cfg["decisions_file"]:
+    if rel is None or rel == cfg["decisions_file"] or is_generated(rel, generated_patterns(repo, cfg)):
         return
     exists = os.path.exists(os.path.join(repo.root, rel))
     if exists and git(repo, "status", "--porcelain", "--ignored", "--", rel).strip():
@@ -570,7 +588,8 @@ def status_line(state):
                  "commits " + ("-" if (rules.get("R7") or {}).get("value") is None else fraction(rules["R7"]))]
         parts += ["lines " + fraction(rules["R9"])] if "R9" in rules else []
         parts += ["hack %d" % hacks] if hacks else []
-        text, color = "%s %s · ✓" % (NAME, " · ".join(parts)), 3 if hacks else 2
+        big = not (rules.get("R9") or {}).get("ok", True)
+        text, color = "%s %s · ✓" % (NAME, " · ".join(parts)), 3 if hacks or big else 2
     if len(text) > 80:
         text = text[:79] + "…"
     return "\033[3%dm%s\033[0m" % (color, text)

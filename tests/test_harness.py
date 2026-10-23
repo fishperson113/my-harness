@@ -242,15 +242,27 @@ class HarnessTest(unittest.TestCase):
         for rid in ("R3", "R4", "R5", "R6"):
             self.assertTrue(any(line.startswith(rid) and line.endswith("ok") for line in report.splitlines()), report)
 
-    def test_t22_r9_changed_lines(self):
-        self.write("big.txt", "".join("line %d\n" % i for i in range(300)))
+    def test_t22_r9_counts_added_lines_only(self):
+        self.write("dead.txt", "".join("line %d\n" % i for i in range(900)))
         self.commit()
-        self.write("big.txt", "".join("line %d\n" % i for i in range(150)))
-        self.write("more.txt", "".join("x %d\n" % i for i in range(260)))
-        self.assertTrue(self.stop_reason().startswith("R9: change set has 410 changed lines (limit 400)"))
+        os.remove(os.path.join(self.root, "dead.txt"))
+        self.write("more.txt", "".join("x %d\n" % i for i in range(410)))
+        self.assertEqual(self.stop_reason(), "")
+        r9 = self.state()["rules"]["R9"]
+        self.assertEqual((r9["value"], r9["ok"]), (410, False))
         self.commit()
         code, stdout = self.run_cmd("status")
         self.assertIn("lines 0/400", stdout)
+
+    def test_t23_generated_files_skipped(self):
+        self.write(".gitattributes", "gen/*.py linguist-generated\nschema.sql -diff\n")
+        self.commit()
+        self.write("package-lock.json", "{}\n" * 600)
+        self.write("poetry.lock", "x\n" * 600)
+        self.write("gen/api.py", long_function("huge", 80))
+        self.write("app.py", "a = 1\n" * 20)
+        self.assertEqual(self.stop_reason(), "")
+        self.assertEqual(self.state()["rules"]["R9"]["value"], 20)
 
     def test_t20_kill_switch(self):
         self.change_files(11)
