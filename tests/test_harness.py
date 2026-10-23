@@ -1,4 +1,5 @@
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -440,6 +441,101 @@ class HarnessTest(unittest.TestCase):
         reason, _ = self.claims_stop(entries, {"stop_hook_active": True})
         self.assertEqual(reason, "")
 
+    def r11_stop(self, entries):
+        self.claims_stop(entries)
+        return self.state()["rules"]["R11"]
+
+    def status_text(self):
+        return re.sub(r"\033\[\d+m", "", self.run_cmd("status")[1])
+
+    def test_t49_r11_missing(self):
+        self.write("etl.py", "x = 1\n")
+        self.assertEqual(self.r11_stop([prompt(), edit(self.root, "etl.py")])["value"], "missing")
+        self.assertTrue(self.run_cmd("status")[1].startswith("\033[33m"))
+        self.assertIn("tested –", self.status_text())
+
+    def test_t50_r11_pass_then_missing(self):
+        self.write("etl.py", "x = 1\n")
+        entries = [prompt(), edit(self.root, "etl.py")] + bash("pytest -q", False)
+        self.assertEqual(self.r11_stop(entries)["value"], "pass")
+        self.assertEqual(self.r11_stop(entries + [edit(self.root, "etl.py")])["value"], "missing")
+
+    def test_t51_r11_fail(self):
+        self.write("etl.py", "x = 1\n")
+        rule = self.r11_stop([prompt(), edit(self.root, "etl.py")] + bash("python -m pytest", True))
+        self.assertEqual((rule["value"], rule["ok"]), ("fail", False))
+
+    def test_t52_r11_none_after_commit(self):
+        self.write("etl.py", "x = 1\n")
+        self.assertEqual(self.r11_stop([prompt(), edit(self.root, "etl.py")])["value"], "missing")
+        self.commit()
+        self.assertNotIn("tested", self.status_text())
+        self.assertEqual(self.state()["rules"]["R11"]["value"], "none")
+
+    def set_config(self, text):
+        with open(os.path.join(self.root, ".git", "my-harness.toml"), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_t53_verify_patterns_empty(self):
+        self.set_config("verify_patterns = []\n")
+        self.write("etl.py", "x = 1\n")
+        self.assertEqual(self.r11_stop([prompt(), edit(self.root, "etl.py")])["value"], "none")
+        self.assertNotIn("R11", self.run_cmd("session")[1])
+
+    def test_t54_claims_disabled(self):
+        self.set_config("claims_enabled = false\n")
+        reason, r10 = self.claims_stop([prompt(), say('[[ran "make test"]]')])
+        self.assertEqual((reason, r10["value"]), ("", None))
+        session = self.run_cmd("session")[1]
+        self.assertNotIn("R10", session)
+        self.assertLessEqual(len(session.splitlines()), 20)
+
+    def test_t55_statusline_priorities(self):
+        self.write("app.py", long_function("load_orders_with_a_really_long_function_name", 60))
+        self.claims_stop([prompt(), edit(self.root, "app.py"), say('[[ran "make test"]]')])
+        raw = self.run_cmd("status")[1]
+        text = re.sub(r"\033\[\d+m", "", raw)
+        self.assertTrue(raw.startswith("\033[31m"))
+        self.assertLessEqual(len(text), 80)
+        self.assertTrue(text.startswith("my-harness ✗ R5 load_orders"), text)
+        self.assertNotIn("…", text)
+        self.commit()
+        self.write("a.py", "x = 1\n")
+        entries = [prompt(), edit(self.root, "a.py")] + bash("pytest", False) + [say('[[src a.py:1 "x = 1"]]')]
+        self.claims_stop(entries)
+        raw = self.run_cmd("status")[1]
+        self.assertTrue(raw.startswith("\033[32m"), raw)
+        self.assertIn("claims 1/1 · tested ✓ · files 1/10", raw)
+        self.claims_stop(entries + [prompt("what does a.py do?"), say("It sets x.")])
+        self.assertIn("claims – · tested ✓", self.status_text())
+
+    def test_t56_check_transcript_option(self):
+        self.claims_stop([prompt(), say('[[ran "make test"]]')])
+        path = self.write_transcript([prompt(), say('[[ran "make test"]]')])
+        live = subprocess.run([sys.executable, HARNESS, "check", "--transcript", path], cwd=self.root,
+                              capture_output=True).stdout.decode("utf-8")
+        self.assertIn('R10: [[ran "make test"]] — no matching Bash command in this turn.', live)
+        cached = subprocess.run([sys.executable, HARNESS, "check"], cwd=self.root, capture_output=True).stdout.decode()
+        self.assertIn("(from last Stop)", cached)
+
+    def test_t57_stop_deterministic(self):
+        self.write("a.py", "def f(x):\n    return x\n")
+        entries = [prompt(), say('[[src a.py:2 "def f("]] [[ran "pytest"]] [[src b.py:1 "abc"]] [[src a.py "x"]]')]
+        first, _ = self.claims_stop(entries)
+        second, _ = self.claims_stop(entries)
+        self.assertTrue(first)
+        self.assertEqual(first.encode(), second.encode())
+
+    def test_t58_harness_claims_on_itself(self):
+        with open(HARNESS, encoding="utf-8") as f:
+            source = f.read()
+        self.write("harness.py", source)
+        line = source.splitlines().index("def main(argv):") + 1
+        reason, r10 = self.claims_stop([prompt(), say('Evidence: [[src harness.py:%d "def main(argv):"]]' % line)])
+        self.assertEqual((reason, r10["value"]), ("", 1))
+        for rid in ("R3", "R4", "R5", "R6"):
+            self.assertTrue(self.state()["rules"][rid]["ok"], rid)
+
 
 def prompt(text="do it"):
     return {"type": "user", "message": {"role": "user", "content": text}}
@@ -451,6 +547,11 @@ def say(text):
 
 def feedback():
     return {"type": "user", "isMeta": True, "message": {"role": "user", "content": "Stop hook feedback: R5: fix it"}}
+
+
+def edit(root, rel):
+    call = {"type": "tool_use", "id": "toolu_edit", "name": "Edit", "input": {"file_path": os.path.join(root, rel)}}
+    return {"type": "assistant", "message": {"role": "assistant", "content": [call]}}
 
 
 def bash(command, error, tool_id=None):

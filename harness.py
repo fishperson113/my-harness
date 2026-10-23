@@ -23,6 +23,11 @@ DEFAULTS = {
     "min_added_lines_for_comment_rule": 10, "max_commits": 3,
     "base_branch": "", "max_retries": 1, "max_added_lines": 400,
     "generated_patterns": [], "claims_enabled": True, "max_claims": 50, "transcript_tail_bytes": 8388608,
+    "verify_patterns": [
+        r"\bpytest\b", r"\bpython3? -m (pytest|unittest)\b", r"\b(npm|pnpm|yarn|bun) (run )?test\b",
+        r"\bgo test\b", r"\bcargo test\b", r"\bmake (test|check)\b", r"\b(mvn|gradlew?)\b.*\btest\b",
+        r"\bdbt (test|build)\b", r"\bairflow (dags|tasks) test\b",
+    ],
 }
 BANNED = [r"[_-](new|old|copy|backup|tmp|final)(\.[^./]*)?$", r"\.(bak|orig|tmp)$", r"~$", r" copy"]
 # api_v2.py is a copy only when api.py already exists next to it.
@@ -635,6 +640,41 @@ def r10(ctx):
     return len(checked) - len(bad), len(checked), [raw[:60] for raw, _ in bad], [msg for _, msg in bad]
 
 
+def verify_regexes(cfg):
+    regexes = []
+    for pattern in cfg["verify_patterns"]:
+        try:
+            regexes.append(re.compile(pattern))
+        except re.error:
+            sys.stderr.write("%s: invalid verify_patterns regex %r skipped\n" % (NAME, pattern))
+    return regexes
+
+
+def code_files(changed):
+    return {p for p in changed if not p.lower().endswith(MD_EXTS)}
+
+
+def r11(ctx):
+    if ctx.transcript is None:
+        return None, None, [], []
+    code, regexes = code_files(ctx.changed), verify_regexes(ctx.cfg)
+    edits = [(path, pos) for path, pos in ctx.transcript["edits"] if path in code]
+    if not edits or not regexes:
+        ctx.extra["R11"] = {"ok": True}
+        return "none", None, [], []
+    path, last = edits[-1]
+    runs = [(cmd, outcome) for cmd, outcome, pos, _ in ctx.transcript["runs"]
+            if pos > last and any(rx.search(cmd) for rx in regexes)]
+    if not runs:
+        ctx.extra["R11"] = {"ok": False}
+        return "missing", None, [], ["R11: last code edit %s was not followed by a test run." % path]
+    command, outcome = runs[-1]
+    verdict = {"ok": "pass", "fail": "fail"}.get(outcome, "unknown")
+    ctx.extra["R11"] = {"ok": verdict == "pass"}
+    notes = ["R11: the last test run after editing %s failed." % path] if verdict == "fail" else []
+    return verdict, None, [command[:60]], notes
+
+
 # Specification registry: (id, blocks Claude, commands that run it, title, check).
 RULES = [
     ("R1", True, "pre stop", "files in change set", r1),
@@ -647,6 +687,7 @@ RULES = [
     ("R8", False, "stop", "hack: exemptions applied", r8),
     ("R9", False, "stop", "lines added (no lockfiles)", r9),
     ("R10", True, "stop", "claims verified", r10),
+    ("R11", False, "stop", "tested after last code edit", r11),
 ]
 
 
@@ -694,9 +735,9 @@ def load_state(repo):
     return read_json(repo, "state.json")
 
 
-def save_state(repo, head, rules, retries):
-    write_json(repo, "state.json", {"computed_at": int(time.time()), "head": head,
-                                    "index_mtime": index_mtime(repo), "rules": rules, "retries": retries})
+def save_state(repo, head, rules, retries, extra=None):
+    write_json(repo, "state.json", dict({"computed_at": int(time.time()), "head": head, "index_mtime": index_mtime(repo),
+                                         "rules": rules, "retries": retries}, **(extra or {})))
 
 
 def out(text):
@@ -714,10 +755,20 @@ def ensure_excluded(repo, name):
         f.write((text + "\n" if text else "") + "/" + name + "\n")
 
 
+CLAIM_RULES = [
+    "- R10: back factual claims with tags; they are checked at Stop.",
+    '  [[src path:line "exact code"]] for code you cite, [[ran "command"]] (add ok or fail) for commands you ran.',
+    '  Put tags in an "Evidence:" footer. Untagged statements are not checked and show as unchecked.',
+]
+TEST_RULE = "- R11: after editing code, run the repo's tests; the status line shows whether you did and how it went."
+
+
 def cmd_session(repo, cfg, data):
     ensure_excluded(repo, cfg["decisions_file"])
     dirs = sorted(docs_dirs(cfg, committed_facts(repo)))
     shown = ", ".join(dirs[:10]) + (" and %d more" % (len(dirs) - 10) if len(dirs) > 10 else "")
+    claims = CLAIM_RULES if cfg["claims_enabled"] else []
+    tests = [TEST_RULE] if verify_regexes(cfg) else []
     out("\n".join([
         "%s is active: git-based checks limit the size and shape of your changes." % NAME,
         "- R1: at most %d files in the uncommitted change set." % cfg["max_files"],
@@ -726,6 +777,7 @@ def cmd_session(repo, cfg, data):
         "- R4: new markdown files only inside docs dirs: %s." % (shown or "none"),
         "- R5: every function you touch stays within %d lines." % cfg["max_function_lines"],
         "- R6: comment lines stay under %d%% of the lines you add to a file." % round(cfg["max_comment_ratio"] * 100),
+    ] + claims + tests + [
         "A deliberate shortcut is allowed if visible: a `hack:` comment on or just above a function",
         "exempts it from R5; one anywhere in a file exempts that file from R6.",
         "`%s` at the repo root is the user's local scratch file: never committed, exempt." % cfg["decisions_file"],
@@ -793,9 +845,16 @@ def cmd_stop(repo, cfg, data):
     if reasons:
         retries[sid] = count + block
     rules = keep_transcript_rules(to_cache(results, ctx.extra), state.get("rules"), ctx)
-    save_state(repo, ctx.head, rules, dict(list(retries.items())[-20:]))
+    save_state(repo, ctx.head, rules, dict(list(retries.items())[-20:]), transcript_stamp(data, ctx, state))
     if block:
         out(json.dumps({"decision": "block", "reason": "\n".join(reasons + [FIX_HINT])}))
+
+
+def transcript_stamp(data, ctx, state):
+    if ctx.transcript is None:
+        return {k: state[k] for k in ("transcript_size", "transcript_mtime") if k in state}
+    st = os.stat(data["transcript_path"])
+    return {"transcript_size": st.st_size, "transcript_mtime": st.st_mtime_ns}
 
 
 def fraction(rule):
@@ -803,30 +862,45 @@ def fraction(rule):
     return "%s/%s" % ("-" if value is None else value, rule.get("limit"))
 
 
+TESTED = {"pass": "tested ✓", "fail": "tested ✗", "missing": "tested –", "unknown": "tested ?"}
+
+
 def violation_label(rid, rule):
     items = rule.get("items") or ["?"]
-    labels = {"R1": "files ", "R2": "new ", "R9": "lines "}
+    labels = {"R1": "files ", "R2": "new ", "R9": "lines ", "R10": "R10 claims "}
     if rid in labels:
         return labels[rid] + fraction(rule)
     return "%s %s" % (rid, items[0].rsplit("/", 1)[-1])
 
 
+def status_parts(rules, bad):
+    """Status line parts, highest priority first."""
+    parts = [violation_label(r, rules[r]) for r in bad]
+    r10, r11 = rules.get("R10") or {}, rules.get("R11") or {}
+    if r10.get("limit") is not None and "R10" not in bad:
+        parts.append("claims " + (fraction(r10) if r10["limit"] else "–"))
+    if r11.get("value") in TESTED:
+        parts.append(TESTED[r11["value"]])
+    commits = rules.get("R7") or {}
+    normal = [("R1", "files " + fraction(rules.get("R1", {}))), ("R2", "new " + fraction(rules.get("R2", {}))),
+              ("R9", "lines " + fraction(rules["R9"]) if "R9" in rules else ""),
+              ("R7", "commits " + ("-" if commits.get("value") is None else fraction(commits))),
+              ("R8", "hack %d" % (rules.get("R8") or {}).get("value", 0) if (rules.get("R8") or {}).get("value") else "")]
+    return parts + [label for rid, label in normal if label and rid not in bad]
+
+
 def status_line(state):
     rules = state.get("rules") or {}
     bad = [rid for rid, blocks, _, _, _ in RULES if blocks and not rules.get(rid, {}).get("ok", True)]
-    hacks = (rules.get("R8") or {}).get("value") or 0
-    if bad:
-        text, color = "%s ✗ %s" % (NAME, " · ".join(violation_label(r, rules[r]) for r in bad)), 1
-    else:
-        parts = ["files " + fraction(rules.get("R1", {})), "new " + fraction(rules.get("R2", {})),
-                 "commits " + ("-" if (rules.get("R7") or {}).get("value") is None else fraction(rules["R7"]))]
-        parts += ["lines " + fraction(rules["R9"])] if "R9" in rules else []
-        parts += ["hack %d" % hacks] if hacks else []
-        big = not (rules.get("R9") or {}).get("ok", True)
-        text, color = "%s %s · ✓" % (NAME, " · ".join(parts)), 3 if hacks or big else 2
-    if len(text) > 80:
-        text = text[:79] + "…"
-    return "\033[3%dm%s\033[0m" % (color, text)
+    parts = status_parts(rules, bad)
+    while True:
+        text = "%s%s %s" % (NAME, " ✗" if bad else "", " · ".join(parts + ([] if bad else ["✓"])))
+        if len(text) <= 80 or len(parts) <= (1 if bad else 0):
+            break
+        parts.pop()
+    warn = (rules.get("R8") or {}).get("value") or not (rules.get("R9") or {}).get("ok", True) \
+        or (rules.get("R11") or {}).get("value") in ("missing", "fail", "unknown")
+    return "\033[3%dm%s\033[0m" % (1 if bad else 3 if warn else 2, text)
 
 
 def cmd_status(repo, cfg, data):
@@ -834,17 +908,29 @@ def cmd_status(repo, cfg, data):
     if not state or state.get("head") != resolve_head(repo) or state.get("index_mtime") != index_mtime(repo):
         ctx = full_ctx(repo, cfg)
         rules = keep_transcript_rules(to_cache(evaluate(ctx, "stop"), ctx.extra), state.get("rules"), ctx)
-        save_state(repo, ctx.head, rules, state.get("retries") or {})
+        if not code_files(ctx.changed):
+            rules["R11"] = {"value": "none", "limit": None, "ok": True, "items": []}
+        save_state(repo, ctx.head, rules, state.get("retries") or {}, transcript_stamp(data, ctx, state))
         state = load_state(repo)
     out(status_line(state))
 
 
+def check_row(rid, title, value, limit, verdict, note=""):
+    shown = "-" if value is None else value
+    out("%-4s %-30s %6s / %-5s %s%s\n" % (rid, title, shown, "-" if limit is None else limit, verdict, note))
+
+
 def cmd_check(repo, cfg, data):
-    results = evaluate(full_ctx(repo, cfg), "stop")
+    ctx = full_ctx(repo, cfg)
+    ctx.transcript = load_transcript(repo, cfg, data.get("transcript_path"))
+    results, cached = evaluate(ctx, "stop"), load_state(repo).get("rules") or {}
     for rid, blocks, title, value, limit, items, reasons in results:
-        shown = "-" if value is None else value
-        verdict = "ok" if not reasons else ("FAIL" if blocks else "warn")
-        out("%s  %-30s %6s / %-5s %s\n" % (rid, title, shown, "-" if limit is None else limit, verdict))
+        if ctx.transcript is None and rid in ("R10", "R11"):
+            rule = cached.get(rid) or {}
+            verdict = "ok" if rule.get("ok", True) else ("FAIL" if blocks else "warn")
+            check_row(rid, title, rule.get("value"), rule.get("limit"), verdict, " (from last Stop)")
+        else:
+            check_row(rid, title, value, limit, "ok" if not reasons else ("FAIL" if blocks else "warn"))
     for rid, blocks, title, value, limit, items, reasons in results:
         for reason in reasons:
             out(reason + "\n")
@@ -864,12 +950,16 @@ def log_error(command, cwd, exc):
         pass
 
 
+def check_args(argv):
+    return {"transcript_path": argv[3]} if len(argv) > 3 and argv[2] == "--transcript" else {}
+
+
 def main(argv):
     if os.environ.get(OFF_ENV) == "1" or len(argv) < 2 or argv[1] not in COMMANDS:
         return 0
     cwd = os.getcwd()
     try:
-        data = {} if argv[1] == "check" else json.loads(sys.stdin.read() or "{}")
+        data = check_args(argv) if argv[1] == "check" else json.loads(sys.stdin.read() or "{}")
         cwd = data.get("cwd") or (data.get("workspace") or {}).get("current_dir") or cwd
         repo = find_repo(cwd)
         if repo:
