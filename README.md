@@ -30,7 +30,7 @@ The plugin registers the SessionStart, PreToolUse and Stop hooks. It does not to
 2. Merge the `hooks` and `statusLine` blocks from [`examples/settings.json`](examples/settings.json) into `~/.claude/settings.json`.
 3. Already have a status line? Call `python3 ~/.claude/my-harness/harness.py status` from your script and append its output.
 
-Run `python3 harness.py check` in any pane for the full R1–R9 report. It never blocks and never writes the cache.
+Run `python3 harness.py check` in any pane for the full R1–R11 report. It never blocks and never writes the cache. R10 and R11 come from the last Stop unless you pass `--transcript PATH`.
 
 ## Rules
 
@@ -45,6 +45,8 @@ Run `python3 harness.py check` in any pane for the full R1–R9 report. It never
 | R7 | Commits on the branch ahead of the base branch | ≤ 3 | stop | show |
 | R8 | `hack:` exemptions actually applied (functions exempt from R5, files exempt from R6) | no limit | stop | show |
 | R9 | Lines added in the change set (new files in full; deletions not counted) | ≤ 400 | stop | show |
+| R10 | Claims tagged in Claude's answer this turn match the repo and the transcript ([Claims](#claims)) | all correct | stop | block |
+| R11 | After the last code edit, a test command ran, and its result | shown | stop | show |
 
 File size is never limited: a 10,000-line legacy file is fine. R9 only reports how much one change adds; it never blocks, so Claude is never pushed to compress, delete tests or revert work to fit.
 
@@ -53,6 +55,28 @@ File size is never limited: a 10,000-line legacy file is fine. R9 only reports h
 - `decisions.md` at the repo root is your local scratch file. It is added to `.git/info/exclude` and exempt from all rules.
 - R5 and R6 use a per-extension table (Python, JS/TS, Go, Rust, Kotlin, Java/C#/C/C++, shell, SQL, YAML/TOML). Other files skip R5 and R6.
 - Generated files are not part of the change set, so no rule looks at them: built-in lockfiles (`*.lock`, `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `go.sum`, `*.min.js`, `*.min.css`), `generated_patterns`, and paths marked `-diff`, `binary` or `linguist-generated` in the root `.gitattributes` as committed at `HEAD`. A repo with no commit yet has no docs dirs and no `.gitattributes`.
+
+## Claims
+
+R10 checks only what Claude tags; untagged statements are not checked, and the status line shows `claims –` for a turn with no tags. Tags inside fenced code blocks or inline backticks are ignored.
+
+| Tag | Claim |
+| --- | --- |
+| `[[src PATH:LINE "SNIPPET"]]` | Line LINE of PATH contains SNIPPET |
+| `[[src PATH:START-END "SNIPPET"]]` | Lines START to END (at most 30) contain SNIPPET |
+| `[[ran "COMMAND"]]` | COMMAND ran as a Bash command in this turn |
+| `[[ran "COMMAND" ok]]` | It ran and succeeded |
+| `[[ran "COMMAND" fail]]` | It ran and failed |
+
+Whitespace runs collapse to one space before matching; case matters. `ran` matches when COMMAND is a substring of a command Claude ran this turn, so `cd x && pytest -q` satisfies `[[ran "pytest"]]`. A wrong claim (bad line, missing file, snippet not found, command not run, opposite result, malformed tag) blocks Stop once, like R1–R6.
+
+Example footer:
+
+```
+Evidence: [[src dags/etl.py:42 "def load_orders("]] [[ran "pytest tests/test_etl.py" ok]]
+```
+
+R11 recognises test commands by `verify_patterns` (pytest, `python -m unittest`, npm/pnpm/yarn/bun test, go test, cargo test, make test/check, mvn/gradle test, dbt test/build, airflow dags/tasks test). The status line shows `tested ✓`, `tested ✗`, `tested –` (no test since the last code edit) or `tested ?`.
 
 ## Configuration
 
@@ -72,7 +96,17 @@ Later wins: built-in defaults, then `~/.config/my-harness/config.toml`, then `.g
 | `base_branch` | "" | Empty means `origin/HEAD`, then `main`, then `master` |
 | `max_added_lines` | 400 | R9 limit |
 | `generated_patterns` | [] | Extra globs for generated files, added to the built-in lockfile list |
+| `claims_enabled` | true | false turns R10 off and drops its lines from the session rules |
+| `max_claims` | 50 | Tags checked per turn; the rest are counted as skipped |
+| `verify_patterns` | see [Claims](#claims) | Regexes for test commands; replaces the defaults; `[]` turns R11 off |
+| `transcript_tail_bytes` | 8388608 | Bytes read from the end of the transcript (8 MB) |
 | `max_retries` | 1 | Consecutive times Stop makes Claude fix violations; resets on each new user turn |
+
+Airflow tests running in docker:
+
+```toml
+verify_patterns = ["docker compose (run|exec) .*pytest", "\\bairflow dags test\\b"]
+```
 
 State lives in `.git/my-harness/` (`state.json` cache, `facts.json` per-HEAD conventions, `error.log`). Claude cannot write anything inside `.git/` through Write/Edit.
 
@@ -94,5 +128,11 @@ Remove the plugin, or delete the blocks you pasted into `~/.claude/settings.json
 - Unignored directories such as `node_modules` count toward R1 and R2. That is intended: the repo should ignore them.
 - The status line updates at each Stop and when `HEAD` or the index changes, not after every file edit.
 - After a commit, the first command reads the committed conventions again (`git ls-tree`, `git show HEAD:.gitattributes`), so that one run makes up to two extra git calls.
-- `harness.py` is about 700 lines. The only size requirement is one file with no dependencies.
+- Untagged claims are not checked. `claims –` on the status line says the turn had nothing checked.
+- `src` proves the code is where Claude says, not that the explanation around it is right.
+- `ran` matches by substring, so `[[ran "test"]]` matches many commands. Only specific tags are real evidence.
+- Edits made through Bash (`sed -i`, scripts) are not code edits for R11.
+- The transcript format is internal to Claude Code and may change between versions. When it does, R10 and R11 fall back to unknown (fail-open) until the parser and `tests/fixtures/transcript_real.jsonl` are updated. Checked against a real session: subagent turns are not in the main transcript at all, and a successful tool result may omit `is_error`.
+- R10 and R11 on the status line update at each Stop, except that R11 drops to `none` once a commit leaves no code in the change set.
+- `harness.py` is about 1,000 lines. The only size requirement is one file with no dependencies.
 - Every internal error fails open: exit 0, no decision, one line in `.git/my-harness/error.log`.
