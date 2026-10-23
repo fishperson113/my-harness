@@ -4,6 +4,7 @@
 Commands: session, pre, stop, status (hooks and statusline) and check (manual report).
 """
 import fnmatch
+import functools
 import json
 import os
 import re
@@ -785,9 +786,13 @@ def cmd_session(repo, cfg, data):
     ]) + "\n")
 
 
+# Transcripts repeat the same paths, and realpath is slow on Windows.
+realpath = functools.lru_cache(maxsize=4096)(os.path.realpath)
+
+
 def relative(repo, cwd, raw):
     try:
-        rel = os.path.relpath(os.path.realpath(os.path.join(cwd, raw)), os.path.realpath(repo.root))
+        rel = os.path.relpath(realpath(os.path.join(cwd, raw)), realpath(repo.root))
     except ValueError:
         return None
     rel = rel.replace(os.sep, "/")
