@@ -9,7 +9,7 @@ my-harness is a small set of Claude Code hooks that keeps every change Claude ma
 
 ## Install
 
-Requires Python 3.8+ and `git`. Linux and macOS; Windows through WSL.
+Requires Python 3.8+ and `git`. Linux, macOS and Windows.
 
 ### Option 1: Claude Code plugin
 

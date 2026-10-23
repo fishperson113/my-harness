@@ -326,7 +326,7 @@ class HarnessTest(unittest.TestCase):
         sys.path.insert(0, os.path.dirname(HARNESS))
         import harness
         with open(os.path.join(os.path.dirname(__file__), "fixtures", "transcript_real.jsonl"), encoding="utf-8") as f:
-            text = f.read().replace("{REPO}", json.dumps(self.root)[1:-1])
+            text = f.read().replace("{REPO}", json.dumps(self.root)[1:-1]).replace("{SEP}", json.dumps(os.sep)[1:-1])
         path = os.path.join(self.root, ".git", "real.jsonl")
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
