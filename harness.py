@@ -128,7 +128,7 @@ def load_config(repo):
     return cfg
 
 
-def read_changes(repo, cfg):
+def read_changes(repo, cfg, facts):
     """One git status call: (HEAD sha or None, changed paths, new paths)."""
     out = git(repo, "status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all")
     head, changed, new = None, set(), set()
@@ -146,7 +146,7 @@ def read_changes(repo, cfg):
             if fields[1][0] == "A":
                 new.add(fields[-1])
             i += entry[0] == "2"
-    patterns = generated_patterns(repo, cfg)
+    patterns = generated_patterns(cfg, facts)
     skip = {p for p in changed if p == cfg["decisions_file"] or is_generated(p, patterns)}
     return head, changed - skip, new - skip
 
@@ -185,13 +185,30 @@ def read_added(repo, head, new):
     return added
 
 
-def generated_patterns(repo, cfg):
-    patterns = GENERATED + list(cfg["generated_patterns"])
-    for line in (read_file(os.path.join(repo.root, ".gitattributes")) or "").splitlines():
-        fields = line.split()
-        if fields and not fields[0].startswith("#") and GENERATED_ATTRS & set(fields[1:]):
-            patterns.append(fields[0])
-    return patterns
+def attr_patterns(text):
+    return [f[0] for f in (line.split() for line in text.splitlines())
+            if f and not f[0].startswith("#") and GENERATED_ATTRS & set(f[1:])]
+
+
+def committed_facts(repo):
+    """Repo conventions as committed at HEAD (docs dirs, generated globs), cached per HEAD."""
+    head = resolve_head(repo)
+    cached = read_json(repo, "facts.json")
+    if cached and cached.get("head") == head:
+        return cached
+    facts = {"head": head, "docs": [], "attrs": []}
+    if head:
+        files = git(repo, "ls-tree", "-r", "-z", "--name-only", "HEAD").split("\0")
+        facts["docs"] = sorted({parent_dir(p) for p in files if p.lower().endswith(MD_EXTS)
+                                and not ("/" not in p and CONVENTIONAL_MD.match(p))})
+        if ".gitattributes" in files:
+            facts["attrs"] = attr_patterns(git(repo, "show", "HEAD:.gitattributes"))
+    write_json(repo, "facts.json", facts)
+    return facts
+
+
+def generated_patterns(cfg, facts):
+    return GENERATED + list(cfg["generated_patterns"]) + facts["attrs"]
 
 
 def is_generated(path, patterns):
@@ -203,10 +220,8 @@ def parent_dir(path):
     return path.rsplit("/", 1)[0] if "/" in path else "."
 
 
-def docs_dirs(repo, cfg):
-    out = git(repo, "ls-files", "-z", "--", "*.md", "*.mdx", "*.markdown")
-    dirs = {parent_dir(p) for p in out.split("\0") if p and not ("/" not in p and CONVENTIONAL_MD.match(p))}
-    return dirs | {d.strip("/") or "." for d in cfg["docs_extra_dirs"]}
+def docs_dirs(cfg, facts):
+    return set(facts["docs"]) | {d.strip("/") or "." for d in cfg["docs_extra_dirs"]}
 
 
 def read_file(path):
@@ -265,8 +280,8 @@ def index_mtime(repo):
 class Ctx:
     """Git state the rules read. `focus` = new files under test; `verb` words R1/R2."""
 
-    def __init__(self, repo, cfg, head, changed, new, focus=None, verb="has"):
-        self.repo, self.cfg, self.head = repo, cfg, head
+    def __init__(self, repo, cfg, facts, head, changed, new, focus=None, verb="has"):
+        self.repo, self.cfg, self.facts, self.head = repo, cfg, facts, head
         self.changed, self.new, self.verb = changed, new, verb
         self.focus = sorted(new if focus is None else focus)
         self._memo = {}
@@ -280,12 +295,12 @@ class Ctx:
         return self.memo("added", self._read_added)
 
     def _read_added(self):
-        patterns = generated_patterns(self.repo, self.cfg)
+        patterns = generated_patterns(self.cfg, self.facts)
         added = read_added(self.repo, self.head, self.new)
         return {p: lines for p, lines in added.items() if not is_generated(p, patterns)}
 
     def docs(self):
-        return self.memo("docs", lambda: docs_dirs(self.repo, self.cfg))
+        return docs_dirs(self.cfg, self.facts)
 
     def lines(self, path):
         return self.memo("f:" + path, lambda: read_text(os.path.join(self.repo.root, path)))
@@ -333,11 +348,19 @@ def lang_of(path):
 
 
 def indent_end(lines, i):
-    width = len(lines[i]) - len(lines[i].lstrip())
-    j = i
-    while j < len(lines) - 1 and not lines[j].split("#")[0].rstrip().endswith(":"):
-        j += 1
-    end = j
+    """Signature ends at the first ':' outside brackets; code after it means a one-line function."""
+    depth = 0
+    for j in range(i, min(len(lines), i + 50)):
+        code = lines[j].split("#")[0]
+        for pos, ch in enumerate(code):
+            depth += (ch in "([{") - (ch in ")]}")
+            if ch == ":" and depth == 0:
+                return j if code[pos + 1:].strip() else body_end(lines, i, j)
+    return i
+
+
+def body_end(lines, i, j):
+    width, end = len(lines[i]) - len(lines[i].lstrip()), j
     for k in range(j + 1, len(lines)):
         if not lines[k].strip():
             continue
@@ -377,35 +400,47 @@ def functions(lines, lang):
             yield name, i, end
 
 
-def r5(ctx):
-    limit, found = ctx.cfg["max_function_lines"], []
+def scan_functions(ctx):
+    """(violations, hack-exempted) long touched functions as (path, line, name, size)."""
+    limit, found, exempt = ctx.cfg["max_function_lines"], [], []
     for path, added in sorted(ctx.added().items()):
         lang, lines = lang_of(path), ctx.lines(path)
         if not lang or not lines:
             continue
         for name, start, end in functions(lines, lang):
             size = end - start + 1
-            touched = any(n in added for n in range(start + 1, end + 2))
+            if size <= limit or not any(n in added for n in range(start + 1, end + 2)):
+                continue
             hacked = any(HACK.search(lines[j]) for j in range(max(0, start - 2), start + 1))
-            if size > limit and touched and not hacked:
-                found.append((path, start + 1, name, size))
+            (exempt if hacked else found).append((path, start + 1, name, size))
+    return found, exempt
+
+
+def scan_comments(ctx):
+    """(violations, hack-exempted) files whose added lines are too comment-heavy, as (path, percent)."""
+    limit, floor, found, exempt = ctx.cfg["max_comment_ratio"], ctx.cfg["min_added_lines_for_comment_rule"], [], []
+    for path, added in sorted(ctx.added().items()):
+        lang, lines = lang_of(path), ctx.lines(path)
+        if not lang or not lines:
+            continue
+        body = [t.strip() for n, t in sorted(added.items()) if t.strip() and not (n == 1 and t.startswith("#!"))]
+        comments = sum(1 for t in body if t.startswith(lang[2]))
+        if len(body) >= floor and comments / len(body) > limit:
+            hacked = any(HACK.search(line) for line in lines)
+            (exempt if hacked else found).append((path, round(100 * comments / len(body))))
+    return found, exempt
+
+
+def r5(ctx):
+    found, limit = ctx.memo("r5", lambda: scan_functions(ctx))[0], ctx.cfg["max_function_lines"]
     msg = "R5: function %s at %s:%d is %d lines (limit %d). Split it into smaller functions."
     return (max([f[3] for f in found] or [0]), limit, ["%s %dl" % (f[2], f[3]) for f in found],
             [msg % (name, path, line, size, limit) for path, line, name, size in found])
 
 
 def r6(ctx):
-    limit, floor, found = ctx.cfg["max_comment_ratio"], ctx.cfg["min_added_lines_for_comment_rule"], []
-    for path, added in sorted(ctx.added().items()):
-        lang, lines = lang_of(path), ctx.lines(path)
-        if not lang or not lines or any(HACK.search(line) for line in lines):
-            continue
-        body = [t.strip() for n, t in sorted(added.items()) if t.strip() and not (n == 1 and t.startswith("#!"))]
-        comments = sum(1 for t in body if t.startswith(lang[2]))
-        if len(body) >= floor and comments / len(body) > limit:
-            found.append((path, round(100 * comments / len(body))))
+    found, limit = ctx.memo("r6", lambda: scan_comments(ctx))[0], round(ctx.cfg["max_comment_ratio"] * 100)
     msg = "R6: %s adds %d%% comment lines (limit %d%%). Keep only comments whose reason is not obvious."
-    limit = round(limit * 100)
     return (max([f[1] for f in found] or [0]), limit, ["%s %d%%" % (p.rsplit("/", 1)[-1], r) for p, r in found],
             [msg % (p, r, limit) for p, r in found])
 
@@ -417,8 +452,10 @@ def r7(ctx):
 
 
 def r8(ctx):
-    n = sum(bool(HACK.search(text)) for added in ctx.added().values() for text in added.values())
-    return n, None, [], []
+    functions_exempt = ctx.memo("r5", lambda: scan_functions(ctx))[1]
+    files_exempt = ctx.memo("r6", lambda: scan_comments(ctx))[1]
+    items = ["%s (R5)" % f[2] for f in functions_exempt] + ["%s (R6)" % f[0].rsplit("/", 1)[-1] for f in files_exempt]
+    return len(items), None, items, []
 
 
 def r9(ctx):
@@ -430,15 +467,15 @@ def r9(ctx):
 
 # Specification registry: (id, blocks Claude, commands that run it, title, check).
 RULES = [
-    ("R1", True, "pre stop status", "files in change set", r1),
-    ("R2", True, "pre stop status", "new files", r2),
+    ("R1", True, "pre stop", "files in change set", r1),
+    ("R2", True, "pre stop", "new files", r2),
     ("R3", True, "pre stop", "new files with banned names", r3),
     ("R4", True, "pre stop", "new markdown outside docs", r4),
     ("R5", True, "stop", "longest touched function", r5),
     ("R6", True, "stop", "comment % of added lines", r6),
-    ("R7", False, "stop status", "commits ahead of base", r7),
-    ("R8", False, "stop", "hack: markers added", r8),
-    ("R9", False, "stop status", "lines added (no lockfiles)", r9),
+    ("R7", False, "stop", "commits ahead of base", r7),
+    ("R8", False, "stop", "hack: exemptions applied", r8),
+    ("R9", False, "stop", "lines added (no lockfiles)", r9),
 ]
 
 
@@ -455,24 +492,31 @@ def to_cache(results):
             for rid, _, _, v, lim, items, reasons in results}
 
 
-def load_state(repo):
+def read_json(repo, name):
     try:
-        with open(os.path.join(repo.gitdir, NAME, "state.json"), encoding="utf-8") as f:
-            state = json.load(f)
-        return state if state.get("version") == STATE_VERSION else {}
-    except (OSError, ValueError, AttributeError):
+        with open(os.path.join(repo.gitdir, NAME, name), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) and data.get("version") == STATE_VERSION else {}
+    except (OSError, ValueError):
         return {}
 
 
-def save_state(repo, head, rules, retries):
+def write_json(repo, name, data):
     d = os.path.join(repo.gitdir, NAME)
     os.makedirs(d, exist_ok=True)
-    state = {"version": STATE_VERSION, "computed_at": int(time.time()), "head": head,
-             "index_mtime": index_mtime(repo), "rules": rules, "retries": retries}
-    tmp = os.path.join(d, "state.json.tmp")
+    tmp = os.path.join(d, name + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, sort_keys=True)
-    os.replace(tmp, os.path.join(d, "state.json"))
+        json.dump(dict(data, version=STATE_VERSION), f, sort_keys=True)
+    os.replace(tmp, os.path.join(d, name))
+
+
+def load_state(repo):
+    return read_json(repo, "state.json")
+
+
+def save_state(repo, head, rules, retries):
+    write_json(repo, "state.json", {"computed_at": int(time.time()), "head": head,
+                                    "index_mtime": index_mtime(repo), "rules": rules, "retries": retries})
 
 
 def out(text):
@@ -492,7 +536,7 @@ def ensure_excluded(repo, name):
 
 def cmd_session(repo, cfg, data):
     ensure_excluded(repo, cfg["decisions_file"])
-    dirs = sorted(docs_dirs(repo, cfg))
+    dirs = sorted(docs_dirs(cfg, committed_facts(repo)))
     shown = ", ".join(dirs[:10]) + (" and %d more" % (len(dirs) - 10) if len(dirs) > 10 else "")
     out("\n".join([
         "%s is active: git-based checks limit the size and shape of your changes." % NAME,
@@ -515,37 +559,45 @@ def relative(repo, cwd, raw):
     except ValueError:
         return None
     rel = rel.replace(os.sep, "/")
-    if rel == "." or rel.split("/")[0] in ("..", ".git"):
+    if rel == "." or rel.split("/")[0] == "..":
         return None
     return rel
+
+
+def deny(reasons):
+    out(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse", "permissionDecision": "deny",
+        "permissionDecisionReason": "\n".join(reasons)}}))
 
 
 def cmd_pre(repo, cfg, data):
     tool = data.get("tool_input") or {}
     raw = tool.get("file_path") or tool.get("notebook_path")
     rel = relative(repo, data.get("cwd") or repo.root, raw) if raw else None
-    if rel is None or rel == cfg["decisions_file"] or is_generated(rel, generated_patterns(repo, cfg)):
+    if rel is not None and rel.split("/")[0] == ".git":
+        return deny(["%s is inside .git/. Harness config, excludes and git state belong to the user." % rel])
+    facts = committed_facts(repo)
+    if rel is None or rel == cfg["decisions_file"] or is_generated(rel, generated_patterns(cfg, facts)):
         return
     exists = os.path.exists(os.path.join(repo.root, rel))
     if exists and git(repo, "status", "--porcelain", "--ignored", "--", rel).strip():
         return  # fast path: already in the change set, or ignored
     if not exists and run_git(repo, "check-ignore", "-q", "--", rel).returncode == 0:
         return
-    head, changed, new = read_changes(repo, cfg)
+    head, changed, new = read_changes(repo, cfg, facts)
     if rel in changed:
         return
     focus = set() if exists else {rel}
-    ctx = Ctx(repo, cfg, head, changed | {rel}, new | focus, focus, "would reach")
+    ctx = Ctx(repo, cfg, facts, head, changed | {rel}, new | focus, focus, "would reach")
     reasons = blocking_reasons(evaluate(ctx, "pre"))
     if reasons:
-        out(json.dumps({"hookSpecificOutput": {
-            "hookEventName": "PreToolUse", "permissionDecision": "deny",
-            "permissionDecisionReason": "\n".join(reasons)}}))
+        deny(reasons)
 
 
 def full_ctx(repo, cfg):
-    head, changed, new = read_changes(repo, cfg)
-    return Ctx(repo, cfg, head, changed, new)
+    facts = committed_facts(repo)
+    head, changed, new = read_changes(repo, cfg, facts)
+    return Ctx(repo, cfg, facts, head, changed, new)
 
 
 def cmd_stop(repo, cfg, data):
@@ -599,8 +651,7 @@ def cmd_status(repo, cfg, data):
     state = load_state(repo)
     if not state or state.get("head") != resolve_head(repo) or state.get("index_mtime") != index_mtime(repo):
         ctx = full_ctx(repo, cfg)
-        rules = dict(state.get("rules") or {}, **to_cache(evaluate(ctx, "status")))
-        save_state(repo, ctx.head, rules, state.get("retries") or {})
+        save_state(repo, ctx.head, to_cache(evaluate(ctx, "stop")), state.get("retries") or {})
         state = load_state(repo)
     out(status_line(state))
 

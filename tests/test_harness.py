@@ -233,7 +233,7 @@ class HarnessTest(unittest.TestCase):
         self.git("checkout", "--", "f03.txt")
         self.assert_denied(self.pre("f03.txt"), "R1: change set would reach 4 files (limit 3)")
 
-    def test_t21_harness_passes_own_rules(self):
+    def test_t27_harness_passes_own_rules(self):
         source = os.path.dirname(HARNESS)
         for rel in ("harness.py", "tests/test_harness.py", "tests/bench.py"):
             with open(os.path.join(source, rel), encoding="utf-8") as f:
@@ -242,7 +242,7 @@ class HarnessTest(unittest.TestCase):
         for rid in ("R3", "R4", "R5", "R6"):
             self.assertTrue(any(line.startswith(rid) and line.endswith("ok") for line in report.splitlines()), report)
 
-    def test_t22_r9_counts_added_lines_only(self):
+    def test_t28_r9_counts_added_lines_only(self):
         self.write("dead.txt", "".join("line %d\n" % i for i in range(900)))
         self.commit()
         os.remove(os.path.join(self.root, "dead.txt"))
@@ -254,7 +254,7 @@ class HarnessTest(unittest.TestCase):
         code, stdout = self.run_cmd("status")
         self.assertIn("lines 0/400", stdout)
 
-    def test_t23_generated_files_skipped(self):
+    def test_t29_generated_files_skipped(self):
         self.write(".gitattributes", "gen/*.py linguist-generated\nschema.sql -diff\n")
         self.commit()
         self.write("package-lock.json", "{}\n" * 600)
@@ -263,6 +263,47 @@ class HarnessTest(unittest.TestCase):
         self.write("app.py", "a = 1\n" * 20)
         self.assertEqual(self.stop_reason(), "")
         self.assertEqual(self.state()["rules"]["R9"]["value"], 20)
+
+    def test_t21_status_green_after_commit(self):
+        self.write("app.py", long_function("load_orders", 60))
+        self.assertTrue(self.stop_reason())
+        self.commit()
+        code, stdout = self.run_cmd("status")
+        self.assertIn("✓", stdout)
+        self.assertNotIn("✗", stdout)
+
+    def test_t22_old_hack_exemption_counted(self):
+        self.write("c.py", "# hack: generated fixtures\nx = 1\n")
+        self.commit()
+        self.write("c.py", "# hack: generated fixtures\nx = 1\n" + "".join("# note %d\nv%d = %d\n" % (i, i, i) for i in range(8)))
+        self.assertEqual(self.stop_reason(), "")
+        r8 = self.state()["rules"]["R8"]
+        self.assertGreaterEqual(r8["value"], 1)
+        self.assertIn("c.py (R6)", r8["items"])
+
+    def test_t23_staged_markdown_does_not_open_docs(self):
+        self.write("docs/a.md", "# a\n")
+        self.commit()
+        self.write("PLAN.md", "plan\n")
+        self.git("add", "PLAN.md")
+        self.assertTrue(self.stop_reason().startswith("R4"))
+        self.assert_denied(self.pre("NOTES.md", "Write"), "R4")
+
+    def test_t24_uncommitted_gitattributes_ignored(self):
+        self.write(".gitattributes", "* -diff\n")
+        self.write("app.py", long_function("load_orders", 60))
+        self.assertIn("R5", self.stop_reason())
+
+    def test_t25_pre_denies_git_dir(self):
+        code, stdout = self.pre(".git/my-harness.toml", "Write")
+        self.assertEqual(json.loads(stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        code, stdout = self.pre(".git/info/exclude")
+        self.assertEqual(json.loads(stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_t26_one_line_python_function(self):
+        self.write("one.py", "def f(): return 1\n" + "x = 1\n" * 70 + "def g(a: int,\n      b: int) -> int:\n    return a\n")
+        self.assertEqual(self.stop_reason(), "")
+        self.assertTrue(self.state()["rules"]["R5"]["ok"])
 
     def test_t20_kill_switch(self):
         self.change_files(11)

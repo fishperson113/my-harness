@@ -30,7 +30,7 @@ The plugin registers the SessionStart, PreToolUse and Stop hooks. It does not to
 2. Merge the `hooks` and `statusLine` blocks from [`examples/settings.json`](examples/settings.json) into `~/.claude/settings.json`.
 3. Already have a status line? Call `python3 ~/.claude/my-harness/harness.py status` from your script and append its output.
 
-Run `python3 harness.py check` in any pane for the full R1–R8 report. It never blocks and never writes the cache.
+Run `python3 harness.py check` in any pane for the full R1–R9 report. It never blocks and never writes the cache.
 
 ## Rules
 
@@ -42,17 +42,17 @@ Run `python3 harness.py check` in any pane for the full R1–R8 report. It never
 | R4 | New markdown files outside the docs dirs | 0 | pre, stop | block |
 | R5 | Touched function longer than the limit | ≤ 50 lines | stop | block |
 | R6 | Share of comment lines in a file's added lines | ≤ 30% | stop | block |
-| R7 | Commits on the branch ahead of the base branch | ≤ 3 | status | show |
-| R8 | `hack:` markers in added lines | no limit | status | show |
-| R9 | Lines added in the change set (new files in full; deletions not counted) | ≤ 400 | stop, status | show |
+| R7 | Commits on the branch ahead of the base branch | ≤ 3 | stop | show |
+| R8 | `hack:` exemptions actually applied (functions exempt from R5, files exempt from R6) | no limit | stop | show |
+| R9 | Lines added in the change set (new files in full; deletions not counted) | ≤ 400 | stop | show |
 
 File size is never limited: a 10,000-line legacy file is fine. R9 only reports how much one change adds; it never blocks, so Claude is never pushed to compress, delete tests or revert work to fit.
 
 - The change set is every file modified against `HEAD` (staged or not), deleted, or untracked and not ignored. A rename counts once.
-- Docs dirs are directories that already hold a tracked markdown file, plus `docs_extra_dirs`. Conventional files at the repo root (exactly `README`, `CHANGELOG`, `CONTRIBUTING`, `LICENSE`, `CODE_OF_CONDUCT`, `SECURITY`, `CLAUDE`, `AGENTS` with a markdown extension) do not make the root a docs dir. Creating one still goes through R4, so Claude cannot add `CLAUDE.md`, `AGENTS.md` or `CHANGELOG.md` on its own. When the repo really needs one, open the root with `docs_extra_dirs = ["."]` in `.git/my-harness.toml`.
+- Docs dirs are directories that hold a markdown file committed at `HEAD` (staging a file does not count), plus `docs_extra_dirs`. Conventional files at the repo root (exactly `README`, `CHANGELOG`, `CONTRIBUTING`, `LICENSE`, `CODE_OF_CONDUCT`, `SECURITY`, `CLAUDE`, `AGENTS` with a markdown extension) do not make the root a docs dir. Creating one still goes through R4, so Claude cannot add `CLAUDE.md`, `AGENTS.md` or `CHANGELOG.md` on its own. When the repo really needs one, open the root with `docs_extra_dirs = ["."]` in `.git/my-harness.toml`.
 - `decisions.md` at the repo root is your local scratch file. It is added to `.git/info/exclude` and exempt from all rules.
 - R5 and R6 use a per-extension table (Python, JS/TS, Go, Rust, Kotlin, Java/C#/C/C++, shell, SQL, YAML/TOML). Other files skip R5 and R6.
-- Generated files are left out of R1, R2, R5, R6 and R9: built-in lockfiles (`*.lock`, `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `go.sum`, `*.min.js`, `*.min.css`), `generated_patterns`, and paths marked `-diff`, `binary` or `linguist-generated` in the root `.gitattributes`.
+- Generated files are not part of the change set, so no rule looks at them: built-in lockfiles (`*.lock`, `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `go.sum`, `*.min.js`, `*.min.css`), `generated_patterns`, and paths marked `-diff`, `binary` or `linguist-generated` in the root `.gitattributes` as committed at `HEAD`. A repo with no commit yet has no docs dirs and no `.gitattributes`.
 
 ## Configuration
 
@@ -74,13 +74,13 @@ Later wins: built-in defaults, then `~/.config/my-harness/config.toml`, then `.g
 | `generated_patterns` | [] | Extra globs for generated files, added to the built-in lockfile list |
 | `max_retries` | 1 | Consecutive times Stop makes Claude fix violations; resets on each new user turn |
 
-State lives in `.git/my-harness/` (`state.json` cache, `error.log`).
+State lives in `.git/my-harness/` (`state.json` cache, `facts.json` per-HEAD conventions, `error.log`). Claude cannot write anything inside `.git/` through Write/Edit.
 
 ## Shortcuts: `hack:` and `MY_HARNESS_OFF`
 
 - A comment containing `hack:` on a function's declaration line, or in the two lines above it, exempts that function from R5.
 - A `hack:` comment anywhere in a file exempts that file from R6.
-- Every `hack:` marker is counted in R8 and turns the status line yellow, so shortcuts stay visible.
+- Every exemption actually applied, including one from an older `hack:` comment, is counted in R8 and turns the status line yellow, so shortcuts stay visible.
 - `MY_HARNESS_OFF=1` turns every command into a no-op, for a deliberate large change.
 
 ## Uninstall
@@ -89,7 +89,10 @@ Remove the plugin, or delete the blocks you pasted into `~/.claude/settings.json
 
 ## Known limits
 
-- Writes made through Bash are not checked in `pre`. The Stop hook catches them.
-- R5 finds functions by indentation and brace counting. Braces inside strings or comments can skew a length.
-- The status line refreshes R1, R2 and R7 only when `HEAD` or the index changes; R3–R6 update at the next Stop.
+- Bash commands bypass `pre`. Stop still catches files that Bash creates, but not Bash edits inside `.git/`.
+- R5 is a heuristic. Braces inside strings, or multi-line SQL strings indented back in a DAG file, can make it count short. Erring on the lenient side is accepted.
+- Unignored directories such as `node_modules` count toward R1 and R2. That is intended: the repo should ignore them.
+- The status line updates at each Stop and when `HEAD` or the index changes, not after every file edit.
+- After a commit, the first command reads the committed conventions again (`git ls-tree`, `git show HEAD:.gitattributes`), so that one run makes up to two extra git calls.
+- `harness.py` is about 700 lines. The only size requirement is one file with no dependencies.
 - Every internal error fails open: exit 0, no decision, one line in `.git/my-harness/error.log`.
