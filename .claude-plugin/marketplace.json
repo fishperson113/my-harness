@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "my-harness",
+  "owner": { "name": "fishperson113" },
+  "plugins": [
+    {
+      "name": "my-harness",
+      "description": "Deterministic git-based limits on the size and shape of Claude's changes.",
+      "source": "./"
+    }
+  ]
+}

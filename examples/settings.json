@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "python3 ~/.claude/my-harness/harness.py session" }] }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [{ "type": "command", "command": "python3 ~/.claude/my-harness/harness.py pre" }]
+      }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "python3 ~/.claude/my-harness/harness.py stop" }] }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "python3 ~/.claude/my-harness/harness.py status"
+  }
+}
