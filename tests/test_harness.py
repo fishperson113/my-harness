@@ -441,6 +441,16 @@ class HarnessTest(unittest.TestCase):
         reason, _ = self.claims_stop(entries, {"stop_hook_active": True})
         self.assertEqual(reason, "")
 
+    def test_t59_corrected_claim_after_block(self):
+        self.write("a.py", "def load_orders(x):\n    return x\n")
+        wrong = [prompt(), say('[[src a.py:2 "def load_orders("]]')]
+        reason, _ = self.claims_stop(wrong)
+        self.assertTrue(reason.startswith("R10:"))
+        fixed = wrong + [feedback(), say('[[src a.py:1 "def load_orders("]]')]
+        reason, r10 = self.claims_stop(fixed, {"stop_hook_active": True})
+        self.assertEqual((reason, r10["value"], r10["limit"], r10["ok"]), ("", 1, 1, True))
+        self.assertNotIn("✗", self.status_text())
+
     def r11_stop(self, entries):
         self.claims_stop(entries)
         return self.state()["rules"]["R11"]

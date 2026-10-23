@@ -311,6 +311,11 @@ def blocks(obj):
     return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
 
 
+def is_feedback(obj):
+    return obj["type"] == "user" and any(
+        (b.get("text") or "").lstrip().startswith(HOOK_FEEDBACK_PREFIXES) for b in blocks(obj) if b.get("type") == "text")
+
+
 def is_prompt(obj):
     if obj["type"] != "user" or obj.get("isMeta"):
         return False
@@ -325,13 +330,15 @@ def parse_transcript(repo, path, size):
     """{"text": assistant text of this turn, "runs": [(command, outcome, pos, in_turn)], "edits": [(path, pos)]}."""
     objs = read_transcript_tail(path, size)
     start = next((i for i in range(len(objs) - 1, -1, -1) if is_prompt(objs[i])), -1)
+    # Claims are read after the last Stop feedback, so a corrected claim replaces the one that was blocked.
+    claims_from = max([start] + [i for i in range(start + 1, len(objs)) if is_feedback(objs[i])])
     errors = {b.get("tool_use_id"): bool(b.get("is_error")) for o in objs if o["type"] == "user"
               for b in blocks(o) if b.get("type") == "tool_result"}
     texts, runs, edits = [], [], []
     for pos, obj in enumerate(objs):
         for b in blocks(obj) if obj["type"] == "assistant" else []:
             data = b.get("input") if isinstance(b.get("input"), dict) else {}
-            if b.get("type") == "text" and pos > start:
+            if b.get("type") == "text" and pos > claims_from:
                 texts.append(b.get("text") or "")
             elif b.get("type") == "tool_use" and b.get("name") == "Bash":
                 error = errors.get(b.get("id"))
@@ -856,10 +863,12 @@ def cmd_stop(repo, cfg, data):
 
 
 def transcript_stamp(data, ctx, state):
-    if ctx.transcript is None:
-        return {k: state[k] for k in ("transcript_size", "transcript_mtime") if k in state}
-    st = os.stat(data["transcript_path"])
-    return {"transcript_size": st.st_size, "transcript_mtime": st.st_mtime_ns}
+    old = {k: state[k] for k in ("transcript_size", "transcript_mtime") if k in state}
+    try:
+        st = os.stat(data["transcript_path"]) if ctx.transcript is not None else None
+    except OSError:  # fail-open: a transcript gone after parsing keeps the old stamp
+        st = None
+    return {"transcript_size": st.st_size, "transcript_mtime": st.st_mtime_ns} if st else old
 
 
 def fraction(rule):
