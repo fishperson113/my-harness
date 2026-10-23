@@ -310,6 +310,156 @@ class HarnessTest(unittest.TestCase):
         self.git("checkout", "--", "f10.txt")
         self.assert_allowed(self.pre("f10.txt", env={"MY_HARNESS_OFF": "1"}))
 
+    def write_transcript(self, entries, raw_lines=()):
+        path = os.path.join(self.root, ".git", "transcript.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("".join(json.dumps(e) + "\n" for e in entries) + "".join(line + "\n" for line in raw_lines))
+        return path
+
+    def claims_stop(self, entries, payload=None, raw_lines=()):
+        path = self.write_transcript(entries, raw_lines)
+        reason = self.stop_reason(dict({"transcript_path": path}, **(payload or {})))
+        return reason, self.state()["rules"]["R10"]
+
+    def test_t30_real_transcript(self):
+        sys.path.insert(0, os.path.dirname(HARNESS))
+        import harness
+        with open(os.path.join(os.path.dirname(__file__), "fixtures", "transcript_real.jsonl"), encoding="utf-8") as f:
+            text = f.read().replace("{REPO}", json.dumps(self.root)[1:-1])
+        path = os.path.join(self.root, ".git", "real.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        objs = harness.read_transcript_tail(path, 1 << 23)
+        self.assertTrue(any(harness.is_prompt(o) for o in objs))
+        self.assertFalse(any(harness.is_prompt(o) for o in objs if o.get("isMeta")))
+        parsed = harness.parse_transcript(harness.find_repo(self.root), path, 1 << 23)
+        outcomes = [(cmd, outcome, in_turn) for cmd, outcome, _, in_turn in parsed["runs"]]
+        self.assertIn(("echo hello", "ok", True), outcomes)
+        self.assertIn(("false", "fail", True), outcomes)
+        self.assertNotIn("ls", [cmd for cmd, _, _ in outcomes])
+        self.assertIn("app.py", [p for p, _ in parsed["edits"]])
+
+    def test_t31_no_transcript(self):
+        self.write("app.py", long_function("load_orders", 60))
+        reason = self.stop_reason()
+        self.assertTrue(reason.startswith("R5"))
+        self.assertNotIn("R10", reason)
+        r10 = self.state()["rules"]["R10"]
+        self.assertEqual((r10["value"], r10["ok"]), (None, True))
+
+    def test_t32_broken_json_line(self):
+        self.write("a.py", "def load_orders(x):\n    return x\n")
+        reason, r10 = self.claims_stop([prompt(), say('[[src a.py:1 "def load_orders("]]')], raw_lines=["{broken"])
+        self.assertEqual((reason, r10["value"], r10["limit"]), ("", 1, 1))
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".git", "my-harness", "error.log")))
+
+    def test_t33_src_exact(self):
+        self.write("a.py", "def load_orders(x):\n    return x\n")
+        reason, r10 = self.claims_stop([prompt(), say('Evidence: [[src a.py:1 "def load_orders("]]')])
+        self.assertEqual((reason, r10["value"], r10["limit"], r10["ok"]), ("", 1, 1, True))
+
+    def test_t34_src_whitespace(self):
+        self.write("a.py", "def f(x):\n    return\tx  +  1\n")
+        reason, r10 = self.claims_stop([prompt(), say('[[src a.py:2 "return x + 1"]]')])
+        self.assertEqual((reason, r10["value"]), ("", 1))
+
+    def test_t35_src_moved(self):
+        self.write("a.py", "def load_orders(x):\n    return x\n")
+        reason, r10 = self.claims_stop([prompt(), say('[[src a.py:2 "def load_orders("]]')])
+        self.assertTrue(reason.startswith("R10:"), reason)
+        self.assertIn("found at L1", reason)
+
+    def test_t36_src_mismatch(self):
+        self.write("a.py", "def load_orders(x):\n    return x\n")
+        reason, r10 = self.claims_stop([prompt(), say('[[src a.py:1 "def save_orders("]]')])
+        self.assertIn("snippet not found in the file", reason)
+        self.assertFalse(r10["ok"])
+
+    def test_t37_src_missing_file(self):
+        reason, r10 = self.claims_stop([prompt(), say('[[src nope.py:1 "abc"]] [[src .git/HEAD:1 "ref:"]]')])
+        self.assertEqual(reason.count("file not found in the repo"), 2)
+
+    def test_t38_src_out_of_range(self):
+        self.write("a.py", "x = 1\n")
+        reason, r10 = self.claims_stop([prompt(), say('[[src a.py:5 "x = 1"]]')])
+        self.assertIn("file has 1 lines", reason)
+
+    def test_t39_src_range_across_lines(self):
+        self.write("etl.py", "a = 1\nrun(\n    retries=3,\n)\n")
+        reason, r10 = self.claims_stop([prompt(), say('[[src etl.py:2-4 "run( retries=3"]]')])
+        self.assertEqual((reason, r10["value"]), ("", 1))
+
+    def test_t40_tags_in_code_ignored(self):
+        text = 'Syntax:\n```\n[[src nope.py:1 "abc"]]\n```\nand `[[ran "zzz"]]` inline.'
+        reason, r10 = self.claims_stop([prompt(), say(text)])
+        self.assertEqual((reason, r10["limit"]), ("", 0))
+
+    def test_t41_malformed(self):
+        reason, r10 = self.claims_stop([prompt(), say('[[src a.py "x"]]')])
+        self.assertIn("tag is malformed", reason)
+
+    def test_t42_duplicates_and_max_claims(self):
+        line = "abcdefghijklmnopqrstuvwxyz0123456789" * 2
+        self.write("a.py", line + "\n")
+        tags = ['[[src a.py:1 "%s"]]' % line[:n] for n in range(3, 63)]
+        with open(os.path.join(self.root, ".git", "my-harness.toml"), "w", encoding="utf-8") as f:
+            f.write("max_claims = 50\n")
+        reason, r10 = self.claims_stop([prompt(), say(" ".join(tags + tags[:5]))])
+        self.assertEqual((reason, r10["value"], r10["limit"], r10["skipped"]), ("", 50, 50, 10))
+
+    def test_t43_ran_previous_turn(self):
+        entries = [prompt("first")] + bash("pytest -q", False) + [prompt("second"), say('[[ran "pytest"]]')]
+        reason, r10 = self.claims_stop(entries)
+        self.assertIn("no matching Bash command in this turn", reason)
+
+    def test_t44_ran_substring(self):
+        reason, r10 = self.claims_stop([prompt()] + bash("cd x &&  pytest -q", False) + [say('[[ran "pytest"]]')])
+        self.assertEqual((reason, r10["value"]), ("", 1))
+
+    def test_t45_ran_outcomes(self):
+        entries = [prompt()] + bash("pytest", True) + [say('[[ran "pytest" ok]] [[ran "pytest" fail]]')]
+        reason, r10 = self.claims_stop(entries)
+        self.assertEqual((r10["value"], r10["limit"]), (1, 2))
+        self.assertEqual(reason.count("R10:"), 1)
+        self.assertIn('[[ran "pytest" ok]] — command ran but the result was the opposite', reason)
+
+    def test_t46_ran_before_stop_block(self):
+        entries = [prompt()] + bash("pytest", False) + [say("done"), feedback(), say('[[ran "pytest" ok]]')]
+        reason, r10 = self.claims_stop(entries)
+        self.assertEqual((reason, r10["value"]), ("", 1))
+
+    def test_t47_subagent_bash_ignored(self):
+        entries = [prompt()] + [dict(e, isSidechain=True) for e in bash("pytest", False)] + [say('[[ran "pytest"]]')]
+        reason, r10 = self.claims_stop(entries)
+        self.assertIn("no matching Bash command", reason)
+
+    def test_t48_r10_block_then_continuation(self):
+        entries = [prompt(), say('[[ran "make test"]]')]
+        reason, _ = self.claims_stop(entries)
+        self.assertTrue(reason.startswith("R10:"))
+        reason, _ = self.claims_stop(entries, {"stop_hook_active": True})
+        self.assertEqual(reason, "")
+
+
+def prompt(text="do it"):
+    return {"type": "user", "message": {"role": "user", "content": text}}
+
+
+def say(text):
+    return {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}}
+
+
+def feedback():
+    return {"type": "user", "isMeta": True, "message": {"role": "user", "content": "Stop hook feedback: R5: fix it"}}
+
+
+def bash(command, error, tool_id=None):
+    tool_id = tool_id or "toolu_%d" % (abs(hash(command)) % 10 ** 8)
+    call = {"type": "tool_use", "id": tool_id, "name": "Bash", "input": {"command": command}}
+    result = {"type": "tool_result", "tool_use_id": tool_id, "content": "", "is_error": error}
+    return [{"type": "assistant", "message": {"role": "assistant", "content": [call]}},
+            {"type": "user", "message": {"role": "user", "content": [result]}}]
+
 
 if __name__ == "__main__":
     unittest.main()

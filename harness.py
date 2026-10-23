@@ -22,7 +22,7 @@ DEFAULTS = {
     "max_function_lines": 50, "max_comment_ratio": 0.30,
     "min_added_lines_for_comment_rule": 10, "max_commits": 3,
     "base_branch": "", "max_retries": 1, "max_added_lines": 400,
-    "generated_patterns": [],
+    "generated_patterns": [], "claims_enabled": True, "max_claims": 50, "transcript_tail_bytes": 8388608,
 }
 BANNED = [r"[_-](new|old|copy|backup|tmp|final)(\.[^./]*)?$", r"\.(bak|orig|tmp)$", r"~$", r" copy"]
 # api_v2.py is a copy only when api.py already exists next to it.
@@ -37,7 +37,8 @@ CONVENTIONAL_MD = re.compile(r"^(readme|changelog|contributing|license|code_of_c
 KEYWORDS = {"if", "for", "while", "switch", "catch", "return", "else", "new", "throw", "case", "do",
             "sizeof", "typeof", "delete", "await", "yield", "elif", "with"}
 HACK = re.compile(r"(#|//|--|/\*|\*)\s*hack:")
-FIX_HINT = "Fix these within the existing change set, or mark a deliberate shortcut with a `hack:` comment."
+FIX_HINT = ("Fix these within the existing change set, correct or remove wrong claims, "
+            "or mark a deliberate shortcut with a hack: comment.")
 
 C_COMMENTS = ("//", "/*", "*")
 JS_FUNC = (r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*(?P<n1>\w+)"
@@ -270,6 +271,83 @@ def commits_ahead(repo, cfg, head):
     return int(p.stdout), re.sub(r"^refs/(heads|remotes)/", "", base)
 
 
+# Transcript format checked on tests/fixtures/transcript_real.jsonl: JSONL user/assistant objects, message.content str
+# or blocks, tool_result.is_error (absent = false), Stop feedback is an isMeta user string, subagents live elsewhere.
+HOOK_FEEDBACK_PREFIXES = ("Stop hook feedback:",)
+EDIT_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+
+
+def norm(text):
+    return " ".join(text.split())
+
+
+def read_transcript_tail(path, size):
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        start = max(0, f.tell() - size)
+        f.seek(start)
+        lines = f.read().split(b"\n")[1 if start else 0:]
+    objs = []
+    for raw in lines:
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("type") in ("user", "assistant") and not obj.get("isSidechain"):
+            objs.append(obj)
+    return objs
+
+
+def blocks(obj):
+    content = (obj.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+
+
+def is_prompt(obj):
+    if obj["type"] != "user" or obj.get("isMeta"):
+        return False
+    kinds = [b.get("type") for b in blocks(obj)]
+    if "text" not in kinds or "tool_result" in kinds:
+        return False
+    text = next(b.get("text") or "" for b in blocks(obj) if b.get("type") == "text")
+    return not text.lstrip().startswith(HOOK_FEEDBACK_PREFIXES)
+
+
+def parse_transcript(repo, path, size):
+    """{"text": assistant text of this turn, "runs": [(command, outcome, pos, in_turn)], "edits": [(path, pos)]}."""
+    objs = read_transcript_tail(path, size)
+    start = next((i for i in range(len(objs) - 1, -1, -1) if is_prompt(objs[i])), -1)
+    errors = {b.get("tool_use_id"): bool(b.get("is_error")) for o in objs if o["type"] == "user"
+              for b in blocks(o) if b.get("type") == "tool_result"}
+    texts, runs, edits = [], [], []
+    for pos, obj in enumerate(objs):
+        for b in blocks(obj) if obj["type"] == "assistant" else []:
+            data = b.get("input") if isinstance(b.get("input"), dict) else {}
+            if b.get("type") == "text" and pos > start:
+                texts.append(b.get("text") or "")
+            elif b.get("type") == "tool_use" and b.get("name") == "Bash":
+                error = errors.get(b.get("id"))
+                outcome = "unknown" if error is None else ("fail" if error else "ok")
+                runs.append((norm(str(data.get("command", ""))), outcome, pos, pos > start))
+            elif b.get("type") == "tool_use" and b.get("name") in EDIT_TOOLS:
+                rel = relative(repo, repo.root, str(data.get("file_path") or data.get("notebook_path") or ""))
+                if rel:
+                    edits.append((rel, pos))
+    return {"text": "\n".join(texts), "runs": runs, "edits": edits}
+
+
+def load_transcript(repo, cfg, path):
+    if not path:
+        return None
+    try:
+        return parse_transcript(repo, path, int(cfg["transcript_tail_bytes"]))
+    except Exception as exc:  # fail-open: a bad transcript only makes R10 and R11 unknown
+        log_error("transcript", repo.root, exc)
+        return None
+
+
 def index_mtime(repo):
     try:
         return os.stat(os.path.join(repo.gitdir, "index")).st_mtime_ns
@@ -284,7 +362,7 @@ class Ctx:
         self.repo, self.cfg, self.facts, self.head = repo, cfg, facts, head
         self.changed, self.new, self.verb = changed, new, verb
         self.focus = sorted(new if focus is None else focus)
-        self._memo = {}
+        self.transcript, self.extra, self._memo = None, {}, {}
 
     def memo(self, key, fn):
         if key not in self._memo:
@@ -465,6 +543,98 @@ def r9(ctx):
     return n, limit, [], [msg % (n, limit, n)] if n > limit else []
 
 
+QUOTED = r'"((?:[^"\\]|\\.)*)"'
+SRC_TAG = re.compile(r"\[\[src (\S+?):(\d+)(?:-(\d+))? " + QUOTED + r"\]\]")
+RAN_TAG = re.compile(r"\[\[ran " + QUOTED + r"(?: (ok|fail))?\]\]")
+CLAIM_HINTS = {
+    "malformed": ("tag is malformed", 'Use [[src path:line "snippet"]] or [[ran "command"]].'),
+    "missing_file": ("file not found in the repo", "Cite a file that exists, or remove the claim."),
+    "out_of_range": ("file has %s lines", "Fix the line number."),
+    "moved": ("snippet is not at that line; found at %s", "Fix the line number."),
+    "mismatch": ("snippet not found in the file", "Quote the code exactly as written, or remove the claim."),
+    "not_run": ("no matching Bash command in this turn", "Run it, or remove the claim."),
+    "failed": ("command ran but the result was the opposite", "Report the real result."),
+}
+
+
+def unescape(text):
+    return re.sub(r"\\(.)", r"\1", text)
+
+
+def find_tags(text):
+    """Yield raw tags outside fenced code and inline code, in order."""
+    text = re.sub(r"`[^`\n]*`", " ", re.sub(r"```.*?(```|$)", " ", text, flags=re.S))
+    for m in re.finditer(r"\[\[(?:src|ran) ", text):
+        full = SRC_TAG.match(text, m.start()) or RAN_TAG.match(text, m.start())
+        if full:
+            yield full.group(0)
+        else:
+            close, line_end = text.find("]]", m.start()), text.find("\n", m.start())
+            stop = min(close + 2 if close >= 0 else len(text), line_end if line_end >= 0 else len(text))
+            yield text[m.start():stop]
+
+
+def parse_tag(raw):
+    """("src", path, start, end, snippet) | ("ran", command, expect) | None when malformed."""
+    m = SRC_TAG.fullmatch(raw)
+    if m:
+        start, path, snippet = int(m.group(2)), re.sub(r"^\./", "", m.group(1)), norm(unescape(m.group(4)))
+        end = int(m.group(3) or start)
+        if 1 <= start <= end and end - start < 30 and 3 <= len(snippet) <= 200:
+            return "src", path, start, end, snippet
+        return None
+    m = RAN_TAG.fullmatch(raw)
+    command = norm(unescape(m.group(1))) if m else ""
+    return ("ran", command, m.group(2)) if m and 2 <= len(command) <= 300 else None
+
+
+def check_src(repo, path, start, end, snippet):
+    rel = relative(repo, repo.root, path)
+    lines = read_text(os.path.join(repo.root, rel)) if rel and rel.split("/")[0] != ".git" else None
+    if lines is None:
+        return "missing_file", ()
+    if end > len(lines):
+        return "out_of_range", (len(lines),)
+    span = end - start + 1
+    if snippet in norm(" ".join(lines[start - 1:end])):
+        return "ok", ()
+    found = [i + 1 for i in range(len(lines) - span + 1) if snippet in norm(" ".join(lines[i:i + span]))]
+    return ("moved", (", ".join("L%d" % n for n in found[:3]),)) if found else ("mismatch", ())
+
+
+def check_ran(runs, command, expect):
+    hits = [outcome for cmd, outcome, _, in_turn in runs if in_turn and command in cmd]
+    if not hits:
+        return "not_run"
+    if expect is None or expect in hits:
+        return "ok"
+    return "unknown" if all(h == "unknown" for h in hits) else "failed"
+
+
+def check_claim(ctx, raw):
+    tag = parse_tag(raw)
+    if tag is None:
+        return "malformed", ()
+    if tag[0] == "src":
+        return check_src(ctx.repo, *tag[1:])
+    return check_ran(ctx.transcript["runs"], tag[1], tag[2]), ()
+
+
+def r10(ctx):
+    if ctx.transcript is None or not ctx.cfg["claims_enabled"]:
+        return None, None, [], []
+    tags = list(dict.fromkeys(find_tags(ctx.transcript["text"])))
+    checked, limit = tags[:int(ctx.cfg["max_claims"])], int(ctx.cfg["max_claims"])
+    ctx.extra["R10"] = {"skipped": max(0, len(tags) - limit)}
+    bad = []
+    for raw in checked:
+        verdict, args = check_claim(ctx, raw)
+        if verdict not in ("ok", "unknown"):
+            reason, hint = CLAIM_HINTS[verdict]
+            bad.append((raw, "R10: %s — %s. %s" % (raw if len(raw) <= 80 else raw[:79] + "…", reason % args, hint)))
+    return len(checked) - len(bad), len(checked), [raw[:60] for raw, _ in bad], [msg for _, msg in bad]
+
+
 # Specification registry: (id, blocks Claude, commands that run it, title, check).
 RULES = [
     ("R1", True, "pre stop", "files in change set", r1),
@@ -476,6 +646,7 @@ RULES = [
     ("R7", False, "stop", "commits ahead of base", r7),
     ("R8", False, "stop", "hack: exemptions applied", r8),
     ("R9", False, "stop", "lines added (no lockfiles)", r9),
+    ("R10", True, "stop", "claims verified", r10),
 ]
 
 
@@ -487,9 +658,18 @@ def blocking_reasons(results):
     return [r for rid, blocks, _, _, _, _, reasons in results if blocks for r in reasons]
 
 
-def to_cache(results):
-    return {rid: {"value": v, "limit": lim, "ok": not reasons, "items": items[:5]}
+def to_cache(results, extra=None):
+    return {rid: dict({"value": v, "limit": lim, "ok": not reasons, "items": items[:5]}, **(extra or {}).get(rid, {}))
             for rid, _, _, v, lim, items, reasons in results}
+
+
+def keep_transcript_rules(rules, old, ctx):
+    """Without a readable transcript, R10 and R11 keep their last known result."""
+    if ctx.transcript is None:
+        for rid in ("R10", "R11"):
+            if rid in (old or {}):
+                rules[rid] = old[rid]
+    return rules
 
 
 def read_json(repo, name):
@@ -601,17 +781,19 @@ def full_ctx(repo, cfg):
 
 
 def cmd_stop(repo, cfg, data):
-    ctx = full_ctx(repo, cfg)
+    ctx, state = full_ctx(repo, cfg), load_state(repo)
+    ctx.transcript = load_transcript(repo, cfg, data.get("transcript_path"))
     results = evaluate(ctx, "stop")
     reasons = blocking_reasons(results)
-    retries, sid = load_state(repo).get("retries") or {}, str(data.get("session_id", ""))
+    retries, sid = state.get("retries") or {}, str(data.get("session_id", ""))
     # Counts consecutive blocks: a new user turn starts at 0; a continuation we did not cause never blocks.
     count = retries.pop(sid, cfg["max_retries"]) if data.get("stop_hook_active") else 0
     retries.pop(sid, None)
     block = bool(reasons) and count < cfg["max_retries"]
     if reasons:
         retries[sid] = count + block
-    save_state(repo, ctx.head, to_cache(results), dict(list(retries.items())[-20:]))
+    rules = keep_transcript_rules(to_cache(results, ctx.extra), state.get("rules"), ctx)
+    save_state(repo, ctx.head, rules, dict(list(retries.items())[-20:]))
     if block:
         out(json.dumps({"decision": "block", "reason": "\n".join(reasons + [FIX_HINT])}))
 
@@ -651,7 +833,8 @@ def cmd_status(repo, cfg, data):
     state = load_state(repo)
     if not state or state.get("head") != resolve_head(repo) or state.get("index_mtime") != index_mtime(repo):
         ctx = full_ctx(repo, cfg)
-        save_state(repo, ctx.head, to_cache(evaluate(ctx, "stop")), state.get("retries") or {})
+        rules = keep_transcript_rules(to_cache(evaluate(ctx, "stop"), ctx.extra), state.get("rules"), ctx)
+        save_state(repo, ctx.head, rules, state.get("retries") or {})
         state = load_state(repo)
     out(status_line(state))
 
