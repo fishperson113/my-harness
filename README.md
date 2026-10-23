@@ -38,7 +38,7 @@ Run `python3 harness.py check` in any pane for the full R1–R8 report. It never
 | --- | --- | --- | --- | --- |
 | R1 | Files in the uncommitted change set | ≤ 10 | pre, stop | block |
 | R2 | New files in that set | ≤ 3 | pre, stop | block |
-| R3 | New files with copy-style names (`_v2`, `_new`, `_old`, `_copy`, `_backup`, `_tmp`, `_final`, `.bak`, `.orig`, `.tmp`, `~`, ` copy`) | 0 | pre, stop | block |
+| R3 | New files with copy-style names (`_new`, `_old`, `_copy`, `_backup`, `_tmp`, `_final`, `.bak`, `.orig`, `.tmp`, `~`, ` copy`; `_v2` only when the unsuffixed file exists, e.g. `api_v2.py` next to `api.py`) | 0 | pre, stop | block |
 | R4 | New markdown files outside the docs dirs | 0 | pre, stop | block |
 | R5 | Touched function longer than the limit | ≤ 50 lines | stop | block |
 | R6 | Share of comment lines in a file's added lines | ≤ 30% | stop | block |
@@ -46,7 +46,7 @@ Run `python3 harness.py check` in any pane for the full R1–R8 report. It never
 | R8 | `hack:` markers in added lines | no limit | status | show |
 
 - The change set is every file modified against `HEAD` (staged or not), deleted, or untracked and not ignored. A rename counts once.
-- Docs dirs are directories that already hold a tracked markdown file, plus `docs_extra_dirs`. Conventional root files (`README`, `CHANGELOG`, `CONTRIBUTING`, `LICENSE`, `CODE_OF_CONDUCT`, `SECURITY`, `CLAUDE`, `AGENTS`) do not make their directory a docs dir.
+- Docs dirs are directories that already hold a tracked markdown file, plus `docs_extra_dirs`. Conventional files at the repo root (exactly `README`, `CHANGELOG`, `CONTRIBUTING`, `LICENSE`, `CODE_OF_CONDUCT`, `SECURITY`, `CLAUDE`, `AGENTS` with a markdown extension) are always allowed there and do not make the root a docs dir. Anywhere else they follow R4 like any other markdown file.
 - `decisions.md` at the repo root is your local scratch file. It is added to `.git/info/exclude` and exempt from all rules.
 - R5 and R6 use a per-extension table (Python, JS/TS, Go, Rust, Kotlin, Java/C#/C/C++, shell, SQL, YAML/TOML). Other files skip R5 and R6.
 
@@ -66,7 +66,7 @@ Later wins: built-in defaults, then `~/.config/my-harness/config.toml`, then `.g
 | `min_added_lines_for_comment_rule` | 10 | R6 skips files with fewer added non-blank lines |
 | `max_commits` | 3 | R7 limit |
 | `base_branch` | "" | Empty means `origin/HEAD`, then `main`, then `master` |
-| `max_retries` | 1 | Times per session Stop makes Claude fix violations |
+| `max_retries` | 1 | Consecutive times Stop makes Claude fix violations; resets on each new user turn |
 
 State lives in `.git/my-harness/` (`state.json` cache, `error.log`).
 

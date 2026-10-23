@@ -22,10 +22,13 @@ DEFAULTS = {
     "min_added_lines_for_comment_rule": 10, "max_commits": 3,
     "base_branch": "", "max_retries": 1,
 }
-BANNED = [r"[_-](v\d+|new|old|copy|backup|tmp|final)(\.[^./]*)?$", r"\.(bak|orig|tmp)$", r"~$", r" copy"]
+BANNED = [r"[_-](new|old|copy|backup|tmp|final)(\.[^./]*)?$", r"\.(bak|orig|tmp)$", r"~$", r" copy"]
+# api_v2.py is a copy only when api.py already exists next to it.
+VERSIONED = re.compile(r"^(.+)[_-]v\d+(\.[^./]*)?$", re.I)
 MD_EXTS = (".md", ".mdx", ".markdown")
-# Files every repo has: always allowed by R4, and they alone do not make a directory a docs dir.
-CONVENTIONAL_MD = re.compile(r"(readme|changelog|contributing|license|code_of_conduct|security|claude|agents)\b", re.I)
+# Root files every repo has: allowed by R4 at the root, and they do not make the root a docs dir.
+CONVENTIONAL_MD = re.compile(r"^(readme|changelog|contributing|license|code_of_conduct|security|claude|agents)"
+                             r"\.(md|mdx|markdown)$", re.I)
 KEYWORDS = {"if", "for", "while", "switch", "catch", "return", "else", "new", "throw", "case", "do",
             "sizeof", "typeof", "delete", "await", "yield", "elif", "with"}
 HACK = re.compile(r"(#|//|--|/\*|\*)\s*hack:")
@@ -183,7 +186,7 @@ def parent_dir(path):
 
 def docs_dirs(repo, cfg):
     out = git(repo, "ls-files", "-z", "--", "*.md", "*.mdx", "*.markdown")
-    dirs = {parent_dir(p) for p in out.split("\0") if p and not CONVENTIONAL_MD.match(p.rsplit("/", 1)[-1])}
+    dirs = {parent_dir(p) for p in out.split("\0") if p and not ("/" not in p and CONVENTIONAL_MD.match(p))}
     return dirs | {d.strip("/") or "." for d in cfg["docs_extra_dirs"]}
 
 
@@ -279,16 +282,22 @@ def r2(ctx):
     return n, limit, [], [msg % (ctx.verb, n, limit)] if n > limit and ctx.focus else []
 
 
+def copies_existing(root, path):
+    m = VERSIONED.match(path)
+    return bool(m) and os.path.isfile(os.path.join(root, m.group(1) + (m.group(2) or "")))
+
+
 def r3(ctx):
     patterns = [re.compile(p, re.I) for p in BANNED + list(ctx.cfg["banned_name_patterns"])]
-    bad = [p for p in ctx.focus if any(rx.search(p.rsplit("/", 1)[-1]) for rx in patterns)]
+    bad = [p for p in ctx.focus if any(rx.search(p.rsplit("/", 1)[-1]) for rx in patterns)
+           or copies_existing(ctx.repo.root, p)]
     msg = "R3: new file %s has a copy-style name. Edit the original file instead of creating a variant."
     return len(bad), 0, bad, [msg % p for p in bad]
 
 
 def r4(ctx):
     md = [p for p in ctx.focus if p.lower().endswith(MD_EXTS) and p != ctx.cfg["decisions_file"]
-          and not CONVENTIONAL_MD.match(p.rsplit("/", 1)[-1])]
+          and not ("/" not in p and CONVENTIONAL_MD.match(p))]
     dirs = ctx.docs() if md else set()
     bad = [p for p in md if parent_dir(p) not in dirs]
     shown = ", ".join(sorted(dirs)[:5]) or "none"
@@ -373,8 +382,9 @@ def r6(ctx):
         if len(body) >= floor and comments / len(body) > limit:
             found.append((path, round(100 * comments / len(body))))
     msg = "R6: %s adds %d%% comment lines (limit %d%%). Keep only comments whose reason is not obvious."
+    limit = round(limit * 100)
     return (max([f[1] for f in found] or [0]), limit, ["%s %d%%" % (p.rsplit("/", 1)[-1], r) for p, r in found],
-            [msg % (p, r, round(limit * 100)) for p, r in found])
+            [msg % (p, r, limit) for p, r in found])
 
 
 def r7(ctx):
@@ -395,7 +405,7 @@ RULES = [
     ("R3", True, "pre stop", "new files with banned names", r3),
     ("R4", True, "pre stop", "new markdown outside docs", r4),
     ("R5", True, "stop", "longest touched function", r5),
-    ("R6", True, "stop", "comment ratio of added lines", r6),
+    ("R6", True, "stop", "comment % of added lines", r6),
     ("R7", False, "stop status", "commits ahead of base", r7),
     ("R8", False, "stop", "hack: markers added", r8),
 ]
@@ -485,13 +495,15 @@ def cmd_pre(repo, cfg, data):
     rel = relative(repo, data.get("cwd") or repo.root, raw) if raw else None
     if rel is None or rel == cfg["decisions_file"]:
         return
+    exists = os.path.exists(os.path.join(repo.root, rel))
+    if exists and git(repo, "status", "--porcelain", "--ignored", "--", rel).strip():
+        return  # fast path: already in the change set, or ignored
+    if not exists and run_git(repo, "check-ignore", "-q", "--", rel).returncode == 0:
+        return
     head, changed, new = read_changes(repo, cfg)
     if rel in changed:
         return
-    ignored = run_git(repo, "check-ignore", "-q", "--", rel)
-    if ignored.returncode == 0:
-        return
-    focus = set() if os.path.exists(os.path.join(repo.root, rel)) else {rel}
+    focus = set() if exists else {rel}
     ctx = Ctx(repo, cfg, head, changed | {rel}, new | focus, focus, "would reach")
     reasons = blocking_reasons(evaluate(ctx, "pre"))
     if reasons:
@@ -510,9 +522,12 @@ def cmd_stop(repo, cfg, data):
     results = evaluate(ctx, "stop")
     reasons = blocking_reasons(results)
     retries, sid = load_state(repo).get("retries") or {}, str(data.get("session_id", ""))
-    block = bool(reasons) and not data.get("stop_hook_active") and retries.get(sid, 0) < cfg["max_retries"]
-    if block:
-        retries[sid] = retries.pop(sid, 0) + 1
+    # Counts consecutive blocks: a new user turn starts at 0; a continuation we did not cause never blocks.
+    count = retries.pop(sid, cfg["max_retries"]) if data.get("stop_hook_active") else 0
+    retries.pop(sid, None)
+    block = bool(reasons) and count < cfg["max_retries"]
+    if reasons:
+        retries[sid] = count + block
     save_state(repo, ctx.head, to_cache(results), dict(list(retries.items())[-20:]))
     if block:
         out(json.dumps({"decision": "block", "reason": "\n".join(reasons + [FIX_HINT])}))
@@ -570,9 +585,9 @@ def cmd_check(repo, cfg, data):
 COMMANDS = {"session": cmd_session, "pre": cmd_pre, "stop": cmd_stop, "status": cmd_status, "check": cmd_check}
 
 
-def log_error(command, exc):
+def log_error(command, cwd, exc):
     try:
-        repo = find_repo(os.getcwd())
+        repo = find_repo(cwd)
         d = os.path.join(repo.gitdir, NAME)
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "error.log"), "a", encoding="utf-8") as f:
@@ -584,14 +599,15 @@ def log_error(command, exc):
 def main(argv):
     if os.environ.get(OFF_ENV) == "1" or len(argv) < 2 or argv[1] not in COMMANDS:
         return 0
+    cwd = os.getcwd()
     try:
         data = {} if argv[1] == "check" else json.loads(sys.stdin.read() or "{}")
-        cwd = data.get("cwd") or (data.get("workspace") or {}).get("current_dir") or os.getcwd()
+        cwd = data.get("cwd") or (data.get("workspace") or {}).get("current_dir") or cwd
         repo = find_repo(cwd)
         if repo:
             COMMANDS[argv[1]](repo, load_config(repo), data)
     except Exception as exc:  # fail-open: a broken harness must never block Claude
-        log_error(argv[1], exc)
+        log_error(argv[1], cwd, exc)
     return 0
 
 

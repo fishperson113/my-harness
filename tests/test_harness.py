@@ -98,7 +98,13 @@ class HarnessTest(unittest.TestCase):
         self.assert_denied(self.pre("n3.txt", "Write"), "R2")
 
     def test_t05_r3(self):
+        self.write("src/utils.py", "x = 1\n")
+        self.commit()
         self.assert_denied(self.pre("src/utils_v2.py", "Write"), "R3")
+        self.assert_denied(self.pre("src/utils_new.py", "Write"), "R3")
+
+    def test_t05b_r3_allows_versioned_without_original(self):
+        self.assert_allowed(self.pre("api_v2.py", "Write"))
 
     def test_t06_r3_ignores_existing(self):
         self.write("old_backup.py", "x = 1\n")
@@ -110,6 +116,13 @@ class HarnessTest(unittest.TestCase):
         self.write("README.md", "# readme\n")
         self.commit()
         self.assert_denied(self.pre("PLAN.md", "Write"), "R4")
+
+    def test_t07b_r4_conventional_names_exact(self):
+        self.write("docs/a.md", "# a\n")
+        self.commit()
+        for rel in ("README-plan.md", "CHANGELOG-draft.md", "AGENTS-notes.md", "src/feature/README.md"):
+            self.assert_denied(self.pre(rel, "Write"), "R4")
+        self.assert_allowed(self.pre("CHANGELOG.md", "Write"))
 
     def test_t08_r4_inside_docs(self):
         self.write("docs/a.md", "# a\n")
@@ -161,12 +174,33 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(self.stop_reason({"stop_hook_active": True}), "")
         self.assertFalse(self.state()["rules"]["R5"]["ok"])
         self.assertTrue(self.stop_reason())
+        self.assertEqual(self.stop_reason({"stop_hook_active": True}), "")
+
+    def test_t15b_new_turn_blocks_again(self):
+        self.write("app.py", long_function("load_orders", 60))
+        self.assertTrue(self.stop_reason())
+        self.assertEqual(self.stop_reason({"stop_hook_active": True}), "")
+        self.assertTrue(self.stop_reason())
+        self.git("checkout", "--", ".")
+        os.remove(os.path.join(self.root, "app.py"))
         self.assertEqual(self.stop_reason(), "")
+        self.assertNotIn("s1", self.state()["retries"])
 
     def test_t16_fail_open(self):
         self.assertEqual(self.run_cmd("pre", raw="{not json"), (0, ""))
         with open(os.path.join(self.root, ".git", "my-harness", "error.log"), encoding="utf-8") as f:
             self.assertTrue(f.read().strip())
+
+    def test_t16b_error_logged_in_json_cwd(self):
+        other = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(self.root, ".git", "my-harness.toml"), "w", encoding="utf-8") as f:
+                f.write("max_files = [\n")
+            code, _ = self.run_cmd("stop", {"cwd": self.root}, cwd=other)
+            self.assertEqual(code, 0)
+            self.assertTrue(os.path.exists(os.path.join(self.root, ".git", "my-harness", "error.log")))
+        finally:
+            shutil.rmtree(other, ignore_errors=True)
 
     def test_t17_deterministic(self):
         self.write("app.py", long_function("a", 60) + long_function("b", 55))
@@ -190,6 +224,15 @@ class HarnessTest(unittest.TestCase):
         self.change_files(4)
         self.git("checkout", "--", "f03.txt")
         self.assert_denied(self.pre("f03.txt"), "R1: change set would reach 4 files (limit 3)")
+
+    def test_t21_harness_passes_own_rules(self):
+        source = os.path.dirname(HARNESS)
+        for rel in ("harness.py", "tests/test_harness.py", "tests/bench.py"):
+            with open(os.path.join(source, rel), encoding="utf-8") as f:
+                self.write(rel, f.read())
+        report = subprocess.run([sys.executable, HARNESS, "check"], cwd=self.root, capture_output=True).stdout.decode()
+        for rid in ("R3", "R4", "R5", "R6"):
+            self.assertTrue(any(line.startswith(rid) and line.endswith("ok") for line in report.splitlines()), report)
 
     def test_t20_kill_switch(self):
         self.change_files(11)
