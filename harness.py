@@ -26,7 +26,7 @@ BANNED = [r"[_-](new|old|copy|backup|tmp|final)(\.[^./]*)?$", r"\.(bak|orig|tmp)
 # api_v2.py is a copy only when api.py already exists next to it.
 VERSIONED = re.compile(r"^(.+)[_-]v\d+(\.[^./]*)?$", re.I)
 MD_EXTS = (".md", ".mdx", ".markdown")
-# Root files every repo has: allowed by R4 at the root, and they do not make the root a docs dir.
+# Root files every repo has: they do not make the root a docs dir. Creating them still goes through R4.
 CONVENTIONAL_MD = re.compile(r"^(readme|changelog|contributing|license|code_of_conduct|security|claude|agents)"
                              r"\.(md|mdx|markdown)$", re.I)
 KEYWORDS = {"if", "for", "while", "switch", "catch", "return", "else", "new", "throw", "case", "do",
@@ -301,8 +301,7 @@ def r3(ctx):
 
 
 def r4(ctx):
-    md = [p for p in ctx.focus if p.lower().endswith(MD_EXTS) and p != ctx.cfg["decisions_file"]
-          and not ("/" not in p and CONVENTIONAL_MD.match(p))]
+    md = [p for p in ctx.focus if p.lower().endswith(MD_EXTS) and p != ctx.cfg["decisions_file"]]
     dirs = ctx.docs() if md else set()
     bad = [p for p in md if parent_dir(p) not in dirs]
     shown = ", ".join(sorted(dirs)[:5]) or "none"

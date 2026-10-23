@@ -49,7 +49,7 @@ Run `python3 harness.py check` in any pane for the full R1–R8 report. It never
 File size is never limited: a 10,000-line legacy file is fine. What is limited is how much one change touches.
 
 - The change set is every file modified against `HEAD` (staged or not), deleted, or untracked and not ignored. A rename counts once.
-- Docs dirs are directories that already hold a tracked markdown file, plus `docs_extra_dirs`. Conventional files at the repo root (exactly `README`, `CHANGELOG`, `CONTRIBUTING`, `LICENSE`, `CODE_OF_CONDUCT`, `SECURITY`, `CLAUDE`, `AGENTS` with a markdown extension) are always allowed there and do not make the root a docs dir. Anywhere else they follow R4 like any other markdown file.
+- Docs dirs are directories that already hold a tracked markdown file, plus `docs_extra_dirs`. Conventional files at the repo root (exactly `README`, `CHANGELOG`, `CONTRIBUTING`, `LICENSE`, `CODE_OF_CONDUCT`, `SECURITY`, `CLAUDE`, `AGENTS` with a markdown extension) do not make the root a docs dir. Creating one still goes through R4, so Claude cannot add `CLAUDE.md`, `AGENTS.md` or `CHANGELOG.md` on its own. When the repo really needs one, open the root with `docs_extra_dirs = ["."]` in `.git/my-harness.toml`.
 - `decisions.md` at the repo root is your local scratch file. It is added to `.git/info/exclude` and exempt from all rules.
 - R5 and R6 use a per-extension table (Python, JS/TS, Go, Rust, Kotlin, Java/C#/C/C++, shell, SQL, YAML/TOML). Other files skip R5 and R6.
 

@@ -120,9 +120,17 @@ class HarnessTest(unittest.TestCase):
     def test_t07b_r4_conventional_names_exact(self):
         self.write("docs/a.md", "# a\n")
         self.commit()
-        for rel in ("README-plan.md", "CHANGELOG-draft.md", "AGENTS-notes.md", "src/feature/README.md"):
+        for rel in ("README-plan.md", "CHANGELOG-draft.md", "AGENTS-notes.md", "src/feature/README.md",
+                    "CLAUDE.md", "AGENTS.md", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md", "CODE_OF_CONDUCT.md"):
             self.assert_denied(self.pre(rel, "Write"), "R4")
-        self.assert_allowed(self.pre("CHANGELOG.md", "Write"))
+
+    def test_t07c_root_opened_by_config(self):
+        self.write("README.md", "# readme\n")
+        self.commit()
+        self.assert_denied(self.pre("CLAUDE.md", "Write"), "R4")
+        with open(os.path.join(self.root, ".git", "my-harness.toml"), "w", encoding="utf-8") as f:
+            f.write('docs_extra_dirs = ["."]\n')
+        self.assert_allowed(self.pre("CLAUDE.md", "Write"))
 
     def test_t08_r4_inside_docs(self):
         self.write("docs/a.md", "# a\n")
