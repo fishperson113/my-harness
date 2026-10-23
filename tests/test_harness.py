@@ -234,6 +234,16 @@ class HarnessTest(unittest.TestCase):
         for rid in ("R3", "R4", "R5", "R6"):
             self.assertTrue(any(line.startswith(rid) and line.endswith("ok") for line in report.splitlines()), report)
 
+    def test_t22_r9_changed_lines(self):
+        self.write("big.txt", "".join("line %d\n" % i for i in range(300)))
+        self.commit()
+        self.write("big.txt", "".join("line %d\n" % i for i in range(150)))
+        self.write("more.txt", "".join("x %d\n" % i for i in range(260)))
+        self.assertTrue(self.stop_reason().startswith("R9: change set has 410 changed lines (limit 400)"))
+        self.commit()
+        code, stdout = self.run_cmd("status")
+        self.assertIn("lines 0/400", stdout)
+
     def test_t20_kill_switch(self):
         self.change_files(11)
         self.git("checkout", "--", "f10.txt")

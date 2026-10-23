@@ -20,7 +20,7 @@ DEFAULTS = {
     "docs_extra_dirs": [], "decisions_file": "decisions.md",
     "max_function_lines": 50, "max_comment_ratio": 0.30,
     "min_added_lines_for_comment_rule": 10, "max_commits": 3,
-    "base_branch": "", "max_retries": 1,
+    "base_branch": "", "max_retries": 1, "max_changed_lines": 400,
 }
 BANNED = [r"[_-](new|old|copy|backup|tmp|final)(\.[^./]*)?$", r"\.(bak|orig|tmp)$", r"~$", r" copy"]
 # api_v2.py is a copy only when api.py already exists next to it.
@@ -160,8 +160,8 @@ def read_text(path):
 
 
 def read_added(repo, head, new):
-    """Map path -> {line number: text} for lines added since HEAD, new files in full."""
-    added, path, line_no, in_hunk = {}, None, 0, False
+    """({path: {line number: text}} added since HEAD with new files in full, count of deleted lines)."""
+    added, path, line_no, in_hunk, deleted = {}, None, 0, False, 0
     for line in git(repo, "diff", head or EMPTY_TREE, "-U0", "--no-color", "--no-ext-diff").split("\n"):
         if line.startswith("diff --git"):
             in_hunk = False
@@ -173,11 +173,13 @@ def read_added(repo, head, new):
         elif in_hunk and line.startswith("+") and path:
             added.setdefault(path, {})[line_no] = line[1:]
             line_no += 1
+        elif in_hunk and line.startswith("-"):
+            deleted += 1
     for path in new - set(added):
         lines = read_text(os.path.join(repo.root, path))
         if lines:
             added[path] = dict(enumerate(lines, 1))
-    return added
+    return added, deleted
 
 
 def parent_dir(path):
@@ -257,8 +259,11 @@ class Ctx:
             self._memo[key] = fn()
         return self._memo[key]
 
+    def diff(self):
+        return self.memo("diff", lambda: read_added(self.repo, self.head, self.new))
+
     def added(self):
-        return self.memo("added", lambda: read_added(self.repo, self.head, self.new))
+        return self.diff()[0]
 
     def docs(self):
         return self.memo("docs", lambda: docs_dirs(self.repo, self.cfg))
@@ -398,6 +403,13 @@ def r8(ctx):
     return n, None, [], []
 
 
+def r9(ctx):
+    added, deleted = ctx.diff()
+    n, limit = sum(len(lines) for lines in added.values()) + deleted, ctx.cfg["max_changed_lines"]
+    msg = "R9: change set has %d changed lines (limit %d). Keep this change smaller, or ask the user to commit first."
+    return n, limit, [], [msg % (n, limit)] if n > limit else []
+
+
 # Specification registry: (id, blocks Claude, commands that run it, title, check).
 RULES = [
     ("R1", True, "pre stop status", "files in change set", r1),
@@ -408,6 +420,7 @@ RULES = [
     ("R6", True, "stop", "comment % of added lines", r6),
     ("R7", False, "stop status", "commits ahead of base", r7),
     ("R8", False, "stop", "hack: markers added", r8),
+    ("R9", True, "stop status", "lines changed (+/-)", r9),
 ]
 
 
@@ -471,6 +484,7 @@ def cmd_session(repo, cfg, data):
         "- R4: new markdown files only inside docs dirs: %s." % (shown or "none"),
         "- R5: every function you touch stays within %d lines." % cfg["max_function_lines"],
         "- R6: comment lines stay under %d%% of the lines you add to a file." % round(cfg["max_comment_ratio"] * 100),
+        "- R9: at most %d changed lines (added + deleted) in the change set." % cfg["max_changed_lines"],
         "A deliberate shortcut is allowed if visible: a `hack:` comment on or just above a function",
         "exempts it from R5; one anywhere in a file exempts that file from R6.",
         "`%s` at the repo root is the user's local scratch file: never committed, exempt." % cfg["decisions_file"],
@@ -540,8 +554,9 @@ def fraction(rule):
 
 def violation_label(rid, rule):
     items = rule.get("items") or ["?"]
-    if rid in ("R1", "R2"):
-        return ("files " if rid == "R1" else "new ") + fraction(rule)
+    labels = {"R1": "files ", "R2": "new ", "R9": "lines "}
+    if rid in labels:
+        return labels[rid] + fraction(rule)
     return "%s %s" % (rid, items[0].rsplit("/", 1)[-1])
 
 
@@ -554,6 +569,7 @@ def status_line(state):
     else:
         parts = ["files " + fraction(rules.get("R1", {})), "new " + fraction(rules.get("R2", {})),
                  "commits " + ("-" if (rules.get("R7") or {}).get("value") is None else fraction(rules["R7"]))]
+        parts += ["lines " + fraction(rules["R9"])] if "R9" in rules else []
         parts += ["hack %d" % hacks] if hacks else []
         text, color = "%s %s · ✓" % (NAME, " · ".join(parts)), 3 if hacks else 2
     if len(text) > 80:

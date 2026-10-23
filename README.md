@@ -44,6 +44,9 @@ Run `python3 harness.py check` in any pane for the full R1–R8 report. It never
 | R6 | Share of comment lines in a file's added lines | ≤ 30% | stop | block |
 | R7 | Commits on the branch ahead of the base branch | ≤ 3 | status | show |
 | R8 | `hack:` markers in added lines | no limit | status | show |
+| R9 | Changed lines in the change set (added + deleted, new files in full) | ≤ 400 | stop | block |
+
+File size is never limited: a 10,000-line legacy file is fine. What is limited is how much one change touches.
 
 - The change set is every file modified against `HEAD` (staged or not), deleted, or untracked and not ignored. A rename counts once.
 - Docs dirs are directories that already hold a tracked markdown file, plus `docs_extra_dirs`. Conventional files at the repo root (exactly `README`, `CHANGELOG`, `CONTRIBUTING`, `LICENSE`, `CODE_OF_CONDUCT`, `SECURITY`, `CLAUDE`, `AGENTS` with a markdown extension) are always allowed there and do not make the root a docs dir. Anywhere else they follow R4 like any other markdown file.
@@ -66,6 +69,7 @@ Later wins: built-in defaults, then `~/.config/my-harness/config.toml`, then `.g
 | `min_added_lines_for_comment_rule` | 10 | R6 skips files with fewer added non-blank lines |
 | `max_commits` | 3 | R7 limit |
 | `base_branch` | "" | Empty means `origin/HEAD`, then `main`, then `master` |
+| `max_changed_lines` | 400 | R9 limit |
 | `max_retries` | 1 | Consecutive times Stop makes Claude fix violations; resets on each new user turn |
 
 State lives in `.git/my-harness/` (`state.json` cache, `error.log`).
